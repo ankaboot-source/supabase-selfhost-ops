@@ -333,3 +333,26 @@
 
 - name: Start Supabase
   command: "bash /home/{{ deploy_user }}/{{ supabase_path }}/start-supabase.sh"
+
+# --- Realtime tenant rate limits ---------------------------------------------
+# Realtime throttles postgres-change events per tenant to 100/s by default.
+# Bulk mining writes persons faster than that, so realtime drops events
+# ("MessagePerSecondRateLimitReached") and the credits/profile channel in the
+# same cluster can be starved. The per-tenant limits live in _realtime.tenants,
+# which is owned by the supabase_admin superuser — the non-superuser migration
+# runner cannot update it — so apply idempotently here through the local db
+# container. Realtime's tenant cache expires (~60s default), so the raised
+# limits are picked up without a container restart.
+- name: Raise realtime tenant rate limits
+  ansible.builtin.shell: >-
+    docker exec
+    supabase-db{{ '-' + deploy_env | default('changeit') if deploy_env | default('changeit') != 'changeit' else '' }}
+    psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 -c
+    "UPDATE _realtime.tenants
+       SET max_events_per_second = 1000, max_bytes_per_second = 1000000
+       WHERE max_events_per_second <> 1000 OR max_bytes_per_second <> 1000000;"
+  register: realtime_limits_result
+  changed_when: "'UPDATE 1' in realtime_limits_result.stdout"
+  # A brand-new volume has no tenant row until the first realtime boot; the next
+  # deploy after first boot applies the limits.
+  failed_when: false
