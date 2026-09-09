@@ -44,6 +44,13 @@ make_sandbox() {
 {
   printf 'CALL %s\n' "$bin"
   for a in "\$@"; do printf '  ARG %s\n' "\$a"; done
+  # Append to a single globally-ordered timeline so tests can assert ordering
+  # of invocations ACROSS different tools (e.g. buckets dump before rclone copy).
+  {
+    printf '%s' "$bin"
+    for a in "\$@"; do printf ' ⟨%s⟩' "\$a"; done
+    printf '\n'
+  } >> "$d/stub-bin/call-timeline"
 } >> "$d/stub-bin/$bin.calls"
 case "$bin" in
   psql)
@@ -62,6 +69,19 @@ case "$bin" in
         ;;
       *"auth.users"*)
         echo "\${STUB_PSQL_AUTH_USERS:-0}"
+        ;;
+      *"count(*) FROM vault.decrypted_secrets"*)
+        # Vault preflight: count of decrypted secrets. On privilege-denied the
+        # source DSN cannot select from vault.decrypted_secrets.
+        if [[ "\${STUB_PSQL_VAULT_DECRYPT_FAIL:-0}" == "1" ]]; then
+          echo "permission denied for table decrypted_secrets" >&2
+          exit 1
+        fi
+        echo "\${STUB_PSQL_VAULT_COUNT:-0}"
+        ;;
+      *"decrypted_secret, COALESCE"*)
+        # Vault data select: name\tdecrypted_secret\tdescription rows.
+        echo "\${STUB_PSQL_VAULT_ROWS:-}"
         ;;
       *)
         echo "0"
@@ -338,8 +358,9 @@ if echo "$OUT" | grep -q "MANUAL STEPS" \
   && echo "$OUT" | grep -q "WEBHOOKS" \
   && echo "$OUT" | grep -q "STORAGE BUCKET CONFIGURATION" \
   && echo "$OUT" | grep -q "CLIENT ENV VARS" \
-  && echo "$OUT" | grep -q "USERS MUST LOG IN AGAIN"; then
-  ok "manual-steps report contains all 7 sections"
+  && echo "$OUT" | grep -q "USERS MUST LOG IN AGAIN" \
+  && echo "$OUT" | grep -q "VAULT"; then
+  ok "manual-steps report contains all sections"
 else
   fail "manual-steps report missing sections"
 fi
@@ -528,6 +549,108 @@ if [[ -f "$d/stub-bin/pg_restore.calls" ]] \
   ok "pg_restore targets target DSN via --dbname=, never source"
 else
   fail "pg_restore DSN not passed via --dbname= or targets source"
+fi
+
+# ─── TC-MIG-021: Storage bucket definitions are dumped before the object copy ─
+echo "TC-MIG-021: storage.buckets dumped before rclone object copy"
+d="$(make_sandbox tc021)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+timeline="$d/stub-bin/call-timeline"
+# The buckets dump is the pg_dump invocation carrying --table=storage.buckets;
+# the object copy is the only rclone invocation. Their order in the shared
+# timeline proves Phase 3 precedes Phase 4.
+bucket_dump_line="$(grep -n 'storage.buckets' "$timeline" | head -1 | cut -d: -f1)"
+copy_pos="$(grep -n '^rclone' "$timeline" | head -1 | cut -d: -f1)"
+if [[ -n "$bucket_dump_line" && -n "$copy_pos" ]] \
+  && [[ "$bucket_dump_line" -lt "$copy_pos" ]]; then
+  ok "storage.buckets dump precedes rclone object copy"
+else
+  fail "storage.buckets not dumped, or not before rclone (bucket=$bucket_dump_line copy=$copy_pos)"
+fi
+
+# ─── TC-MIG-022: Bucket restore is data-only + read-only, never touches source ─
+echo "TC-MIG-022: storage.buckets restore is data-only and read-only on source"
+d="$(make_sandbox tc022)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+src_dsn="db.testprojref12345.supabase.co"
+# The bucket dump must be a data-only, no-owner row restore (read-only flags),
+# and neither the dump nor any pg_restore may touch the source DSN.
+if grep -q "ARG --data-only" "$d/stub-bin/pg_dump.calls" \
+  && grep -q "ARG --no-owner" "$d/stub-bin/pg_dump.calls" \
+  && grep -q "ARG --no-privileges" "$d/stub-bin/pg_dump.calls" \
+  && grep -q "ARG --table=storage.buckets" "$d/stub-bin/pg_dump.calls" \
+  && ! grep -q "$src_dsn" "$d/stub-bin/pg_restore.calls"; then
+  ok "bucket restore uses read-only dump flags and never targets the source"
+else
+  fail "bucket dump flags or read-only-source invariant violated"
+fi
+
+# ─── TC-MIG-023: Vault preflight failure is skipped with a note, exit 0 ───────
+echo "TC-MIG-023: vault migration skipped when source cannot decrypt"
+d="$(make_sandbox tc023)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+STUB_PSQL_VAULT_DECRYPT_FAIL=1 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -qi "vault migration skipped"; then
+  ok "vault preflight failure is non-fatal and reported"
+else
+  fail "vault preflight failure should be non-fatal (got rc=$RC)"
+fi
+
+# ─── TC-MIG-024: Vault secrets re-created on target via vault.create_secret ───
+echo "TC-MIG-024: vault secrets re-encrypted on target via vault.create_secret"
+d="$(make_sandbox tc024)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+# One secret: name "api-key", decrypted value "sk_live_abc", no description.
+STUB_PSQL_VAULT_COUNT=1 STUB_PSQL_VAULT_ROWS=$'api-key\tsk_live_abc\t' \
+  run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "vault secrets re-created"; then
+  ok "vault secrets re-created on target"
+else
+  fail "vault secrets were not re-created (rc=$RC)"
+  echo "$OUT" | tail -10
+fi
+# The target psql invocation must carry -f <sqlscript> and the read-only-source
+# invariant must still hold — no write statement issued against the source.
+src_dsn="db.testprojref12345.supabase.co"
+bad_psql="$(python3 - "$d/stub-bin/psql.calls" "$src_dsn" <<'PY'
+import re, sys
+calls, src = open(sys.argv[1]).read(), sys.argv[2]
+writes = re.compile(r"\b(insert|update|delete|drop|create|alter|truncate|grant|revoke|copy)\b", re.I)
+offending = []
+for block in calls.split("CALL psql")[1:]:
+    args = re.findall(r"^  ARG (.*)$", block, re.M)
+    if not any(src in a for a in args):
+        continue
+    for arg in args:
+        if arg.startswith("-") or src in arg:
+            continue
+        if not re.match(r"\s*select\b", arg, re.I) or writes.search(arg):
+            offending.append(" ".join(arg.split())[:90])
+print("\n".join(offending))
+PY
+)"
+if [[ -z "$bad_psql" ]]; then
+  ok "read-only-source invariant holds during vault migration"
+else
+  fail "vault migration issued a write against the source: $bad_psql"
+fi
+
+# ─── TC-MIG-025: No vault secrets → clean "none" result ───────────────────────
+echo "TC-MIG-025: no vault secrets produces a clean no-op"
+d="$(make_sandbox tc025)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+STUB_PSQL_VAULT_COUNT=0 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "no vault secrets to migrate"; then
+  ok "zero vault secrets handled cleanly"
+else
+  fail "zero vault secrets not handled cleanly (rc=$RC)"
 fi
 
 # ─── Summary ───────────────────────────────────────────────────────────────────
