@@ -2,9 +2,15 @@
 # =============================================================================
 # migrate.sh — Migrate a Supabase Cloud project into a self-hosted instance.
 # =============================================================================
-# Layer 1 walking skeleton: schema+data, auth users (UUIDs preserved), storage
-# objects (copy only), and a manual-steps report. Read-only against the source.
-# Refuses a non-empty target. No resumability — a failure means starting over.
+# Walking skeleton: schema+data, auth users (UUIDs preserved), storage bucket
+# definitions + objects, vault secrets (re-encrypted on the target), and a
+# manual-steps report. Read-only against the source. Refuses a non-empty target.
+# No resumability — a failure means starting over.
+#
+# The script is ALWAYS read-only against the source:
+#   - pg_dump (no write flags) reads the source.
+#   - psql against the source is only ever SELECT.
+#   - All writes (pg_restore, rclone, vault.create_secret) target the target DSN.
 #
 # Usage:
 #   ./migrate.sh --config env/migrate.yml --yes
@@ -63,7 +69,9 @@ The script:
   - Refuses to run against a non-empty target
   - Dumps and restores the database (schema + data, Supabase-managed schemas)
   - Migrates auth.users and auth.identities with UUIDs preserved
+  - Restores storage bucket definitions (required for the object copy)
   - Copies storage objects via rclone (read-only against source)
+  - Migrates vault secrets, re-encrypted on the target
   - Prints a manual-steps report listing everything NOT migrated
 
 INVARIANT: read-only against the source project. Always. At every layer.
@@ -197,9 +205,12 @@ add_note() { RUNTIME_NOTES+=("$1"); }
 LOG_DIR="$(mktemp -d -t migrate-logs-XXXXXX)"
 DUMP_FILE=""
 AUTH_DUMP=""
+BUCKET_DUMP=""
+VAULT_ROWS=""
+VAULT_SQL=""
 RCLONE_CONF=""
 cleanup() {
-  rm -f "$DUMP_FILE" "$AUTH_DUMP" "$RCLONE_CONF"
+  rm -f "$DUMP_FILE" "$AUTH_DUMP" "$BUCKET_DUMP" "$VAULT_ROWS" "$VAULT_SQL" "$RCLONE_CONF"
   rm -rf "$LOG_DIR"
 }
 trap cleanup EXIT
@@ -213,8 +224,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
   log "    target DSN: ${TGT_DB_URL}"
   log "    schemas: auto-discovered (excluding Supabase system schemas: auth, storage, realtime, etc.)"
   log "  Phase 2: pg_dump auth.users + auth.identities → pg_restore target (UUIDs preserved)"
-  log "  Phase 3: rclone copy source-storage → target-storage (read-only against source)"
-  log "  Phase 4: print manual-steps report"
+  log "  Phase 3: pg_dump storage.buckets → pg_restore target (bucket definitions)"
+  log "  Phase 4: rclone copy source-storage → target-storage (read-only against source)"
+  log "  Phase 5: vault secrets → re-encrypted on the target via vault.create_secret"
+  log "  Phase 6: print manual-steps report"
   ok "Dry run complete. Re-run without --dry-run to migrate."
   exit 0
 fi
@@ -326,8 +339,42 @@ else
 fi
 rm -f "$AUTH_DUMP"
 
-# ─── Phase 3: Storage objects (rclone copy — read-only against source) ───────
-log "Phase 3: copying storage objects via rclone (read-only against source)…"
+# ─── Phase 3: Storage bucket definitions (before the object copy) ────────────
+# Bucket definitions (id, name, public, file_size_limit, allowed_mime_types,
+# created_at, updated_at) must exist on the target BEFORE rclone copies objects
+# into them — otherwise the object copy hits NoSuchBucket on a fresh instance.
+# Data-only row restore of storage.buckets; the target's own storage schema
+# provides the DDL. Per-bucket RLS policies are NOT migrated (they live in
+# pg_catalog.pg_policy, not storage.policies, and the stack seeds its own
+# defaults) — those remain a manual step.
+log "Phase 3: restoring storage bucket definitions…"
+
+BUCKET_DUMP="$(mktemp -t migrate-buckets-XXXXXX.dump)"
+if "$PG_DUMP" "$SRC_DB_URL" \
+      --format=custom \
+      --no-owner --no-privileges \
+      --data-only \
+      --table="storage.buckets" \
+      --file="$BUCKET_DUMP" 2>"$LOG_DIR/bucket-dump.err"; then
+  if "$PG_RESTORE" \
+      --dbname="$TGT_DB_URL" \
+      --no-owner --no-privileges \
+      --data-only \
+      --exit-on-error \
+      "$BUCKET_DUMP" 2>"$LOG_DIR/bucket-restore.err"; then
+    ok "Phase 3 complete (storage bucket definitions restored)."
+  else
+    warn "storage.buckets restore failed — see $LOG_DIR/bucket-restore.err"
+    add_note "storage.buckets restore failed. Object copy may hit NoSuchBucket."
+  fi
+else
+  warn "storage.buckets dump failed — see $LOG_DIR/bucket-dump.err"
+  add_note "storage.buckets dump failed. Bucket definitions must be re-created manually before object copy."
+fi
+rm -f "$BUCKET_DUMP"
+
+# ─── Phase 4: Storage objects (rclone copy — read-only against source) ───────
+log "Phase 4: copying storage objects via rclone (read-only against source)…"
 
 SRC_STORAGE_ENDPOINT="$(cfg_get "source.storage_endpoint")"
 SRC_STORAGE_AK="$(cfg_get "source.storage_access_key")"
@@ -362,13 +409,94 @@ EOF
 # --progress=no keeps output TTY-free (runs with no TTY attached).
 if "$RCLONE" --config "$RCLONE_CONF" copy src: tgt: \
      --progress=no 2>"$LOG_DIR/rclone.err"; then
-  ok "Phase 3 complete (storage objects copied)."
+  ok "Phase 4 complete (storage objects copied)."
 else
   warn "storage copy failed — see $LOG_DIR/rclone.err (best-effort at this layer)"
   add_note "Storage copy failed. See $LOG_DIR/rclone.err. Re-run rclone manually after fixing the config."
 fi
 
-# ─── Phase 4: Manual-steps report ────────────────────────────────────────────
+# ─── Phase 5: Vault secrets (re-encrypted on the target) ─────────────────────
+# vault.secrets values are pgsodium ciphertext bound to the SOURCE root key, so
+# they cannot be moved verbatim — a data-only restore would yield undecryptable
+# ciphertext on the target. Instead: decrypt each secret on the source (SELECT
+# via vault.decrypted_secrets, read-only) and re-create it on the target via
+# vault.create_secret, which encrypts with the TARGET's own root key.
+log "Phase 5: migrating vault secrets (re-encrypted on the target)…"
+
+# Preflight: the source DSN must be able to decrypt. If it cannot (the pooler
+# role lacks pgsodium privileges), skip the phase with a manual note rather than
+# failing the whole migration.
+if ! "$PSQL" "$SRC_DB_URL" -tAX \
+     -c "SELECT count(*) FROM vault.decrypted_secrets;" 2>"$LOG_DIR/vault-preflight.err"; then
+  warn "vault migration skipped: source cannot decrypt vault.decrypted_secrets."
+  warn "  Grant the source role access to pgsodium, or re-create vault secrets manually."
+  add_note "Vault migration skipped: source cannot decrypt. Secrets must be re-created manually."
+else
+  VAULT_ROWS="$(mktemp -t migrate-vault-rows-XXXXXX.tsv)"
+  VAULT_SQL="$(mktemp -t migrate-vault-XXXXXX.sql)"
+
+  # Read each secret (name, decrypted_secret, description) from the source.
+  # This is a SELECT-only statement — the read-only-source invariant holds.
+  "$PSQL" "$SRC_DB_URL" -tAX -F $'\t' \
+    -c "SELECT name, decrypted_secret, COALESCE(description, '') FROM vault.decrypted_secrets;" \
+    2>"$LOG_DIR/vault-read.err" > "$VAULT_ROWS" \
+    || { warn "could not read vault.decrypted_secrets — see $LOG_DIR/vault-read.err"; add_note "Vault read failed. See $LOG_DIR/vault-read.err."; }
+
+  # Build a single SQL script (proper single-quote escaping via python) that
+  # re-creates each secret on the target via vault.create_secret.
+  python3 - "$VAULT_ROWS" "$VAULT_SQL" <<'PY' || warn "could not build vault SQL script"
+import sys
+
+rows_path, sql_path = sys.argv[1], sys.argv[2]
+
+def esc(s):
+    # Double any single quotes so the value is a valid SQL string literal.
+    return s.replace("'", "''")
+
+statements = []
+seen = set()
+with open(rows_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        # TSV: name \t decrypted_secret \t description
+        parts = line.split("\t", 2)
+        # Secrets may contain tabs only if the last column (description) is
+        # absent; re-join with a guard: the decrypted secret is expected on
+        # column 2, description on column 3. If fewer than 3 parts, pad.
+        while len(parts) < 3:
+            parts.append("")
+        name, secret, desc = parts[0], parts[1], parts[2]
+        # If tabs are truly embedded (unlikely for names/secrets), the safest
+        # behaviour is to keep the value as-is; names with tabs are nonsense.
+        if name in seen or not name:
+            continue
+        seen.add(name)
+        stmt = "SELECT vault.create_secret('%s'::text, '%s'::text, NULLIF('%s','')::text);" \
+               % (esc(name), esc(secret), esc(desc))
+        statements.append(stmt)
+if statements:
+    with open(sql_path, "w") as f:
+        f.write("\n".join(statements) + "\n")
+
+if not statements:
+    sys.stderr.write("vault: no secrets to migrate\n")
+PY
+
+  if [[ ! -s "$VAULT_SQL" ]]; then
+    ok "Phase 5 complete (no vault secrets to migrate)."
+  elif "$PSQL" "$TGT_DB_URL" -q -v ON_ERROR_STOP=1 -f "$VAULT_SQL" \
+       2>"$LOG_DIR/vault-restore.err"; then
+    ok "Phase 5 complete (vault secrets re-created on the target)."
+  else
+    warn "vault create failed — see $LOG_DIR/vault-restore.err"
+    add_note "Vault migration had errors. See $LOG_DIR/vault-restore.err. Re-check secrets manually."
+  fi
+  rm -f "$VAULT_ROWS" "$VAULT_SQL"
+fi
+
+# ─── Phase 6: Manual-steps report ────────────────────────────────────────────
 print_manual_steps() {
   cat <<'REPORT'
 ================================================================================
@@ -382,29 +510,37 @@ print_manual_steps() {
    - [ ] Re-configure SMTP settings (already in env/supabase.yml — verify)
    - [ ] Re-create any MFA / SAML / hooks configuration
 
-2. EDGE FUNCTIONS (not migrated)
-   - [ ] List your functions: supabase functions list --project-ref <ref>
-   - [ ] Deploy each: supabase functions deploy <name>
-         (or copy the source and deploy via the self-hosted CLI)
+2. EDGE FUNCTIONS (not migrated automatically — code is not retrievable from Cloud)
+   - [ ] Copy your function source from your project repo (supabase/functions/<name>/index.ts)
+   - [ ] Deploy each onto the self-hosted host: copy the folder into
+         <supabase_path>/volumes/functions/ and: docker compose restart functions
+   - [ ] Re-create any function secrets/env vars as a .env.functions override
 
-3. CRON JOBS (not migrated)
-   - [ ] Re-create pg_cron jobs: SELECT cron.schedule(...) for each job
-   - [ ] Source list: SELECT * FROM cron.job;
+3. CRON JOBS (migrated best-effort via the schema dump)
+   - [x] pg_cron job definitions carried over by the schema+data restore
+   - [ ] Verify on the target: SELECT * FROM cron.job;
 
-4. WEBHOOKS (not migrated)
-   - [ ] Re-create any database webhooks (Dashboard → Database → Webhooks)
+4. WEBHOOKS (migrated best-effort via the schema dump)
+   - [x] Database webhook definitions (supabase_webhooks.hooks) carried over
+   - [ ] Verify the hooks were reinstalled onto their tables (Dashboard → Database → Webhooks)
 
-5. STORAGE BUCKET CONFIGURATION (not migrated — objects only)
-   - [ ] Re-create bucket definitions (public/private, file size limits, MIME types)
-   - [ ] Re-create any per-bucket RLS policies
+5. STORAGE BUCKET CONFIGURATION (definitions migrated; RLS policies manual)
+   - [x] Bucket definitions (public/private, file size limits, MIME types) — migrated
+   - [ ] Re-create any per-bucket RLS policies (not migrated)
 
-6. CLIENT ENV VARS (operator action)
+6. VAULT (re-encrypted on the target, when the source could decrypt)
+   - [ ] If the vault phase was skipped (source could not decrypt), re-create
+         secrets manually in the self-hosted Dashboard → Database → Vault
+   - [ ] Note: secrets were re-encrypted with the target root key; the original
+         key_id is not preserved (functionally equivalent)
+
+7. CLIENT ENV VARS (operator action)
    - [ ] Update your application's NEXT_PUBLIC_SUPABASE_URL / VITE_SUPABASE_URL
          to point at the self-hosted API URL
    - [ ] Update NEXT_PUBLIC_SUPABASE_ANON_KEY / VITE_SUPABASE_ANON_KEY
          to the self-hosted anon key (from env/supabase.yml)
 
-7. USERS MUST LOG IN AGAIN
+8. USERS MUST LOG IN AGAIN
    - [ ] Notify users that sessions are invalidated; password hashes migrated,
          so existing passwords still work.
 
@@ -420,6 +556,6 @@ REPORT
   printf '================================================================================\n'
 }
 
-log "Phase 4: printing manual-steps report…"
+log "Phase 6: printing manual-steps report…"
 print_manual_steps
 ok "Migration complete. Complete the manual steps above to finish."

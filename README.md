@@ -384,25 +384,36 @@ See [docs/advanced-docs.md](docs/advanced-docs.md#security-hardening).
 ## 🚚 Migration from Supabase Cloud
 
 Once your self-hosted stack is running, `migrate.sh` moves an existing Supabase Cloud
-project into it. It is a **Layer 1 walking skeleton**: it migrates schema, data, auth
-users and storage objects, then prints a checklist of the manual steps that remain.
+project into it. It migrates schema, data, auth users, storage bucket definitions +
+objects, and vault secrets (re-encrypted for the target), then prints a checklist of
+the manual steps that remain. It is **read-only** against the source Cloud project.
 
 ### What migrates automatically
 
-- **Database schema + data** — `pg_dump`/`pg_restore` across the Supabase-managed
-  schemas (`public`, `auth`, `storage`, `_realtime`, `graphql_public`, `extensions`,
-  `pgsodium`). Missing schemas are skipped with a warning.
+- **Database schema + data** — `pg_dump`/`pg_restore` of your user schemas (probe
+  auto-discovers them, excluding the Supabase-managed schemas the stack provisions:
+  `auth`, `storage`, `realtime`, `graphql`, `vault`, `pgsodium`, etc.). Tables, data,
+  SQL functions, triggers, and related definitions within your schemas are migrated —
+  including **pg_cron jobs** (`cron.job`) and **database webhook definitions**
+  (`supabase_webhooks.hooks`), which are carried over best-effort by the same dump.
 - **Auth users** — `auth.users` and `auth.identities` with UUIDs preserved. Password
   hashes migrate, so existing passwords keep working; users must log in again
   (sessions are not migrated).
+- **Storage bucket definitions** — `storage.buckets` (public/private, size limits,
+  MIME types) restored before the object copy, so buckets exist on the target.
 - **Storage objects** — copied with `rclone` from the Cloud S3 endpoint to your
   self-hosted storage, read-only against the source.
+- **Vault secrets** — re-created on the target via `vault.create_secret`, re-encrypted
+  with the target's own root key. Requires the source connection to be able to decrypt
+  (`vault.decrypted_secrets`); if it cannot, the phase is skipped (non-fatal) with a note.
 
 ### What stays manual
 
-Auth configuration, Edge Functions, cron jobs, webhooks, storage bucket configuration
-and client env-var updates. The script prints the full checklist when it finishes —
-the migration is incomplete, but never *silently* incomplete.
+Auth configuration (OAuth/SMTP secrets, MFA), Edge Functions (the source is **not
+downloadable from Cloud** — it must come from your project's `supabase/functions`
+checkout), per-bucket RLS policies, and client env-var updates.
+The script prints the full checklist when it finishes — the migration is incomplete,
+but never *silently* incomplete.
 
 ### Usage
 

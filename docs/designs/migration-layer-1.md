@@ -25,11 +25,15 @@ of it deeply. Incomplete, but never silently incomplete.
 
 - Verification / dry-run
 - Session continuity / resumability
-- Auth config import (manual checklist only at this layer)
+- Auth config import (manual checklist only)
 - Downtime reduction
-- Edge Functions migration (listed as manual steps)
-- Cron jobs / webhooks migration (listed as manual steps)
-- Storage bucket config reconciliation (objects only, no bucket config)
+- Edge Function source migration (code is not retrievable from Cloud — see §7)
+- Per-bucket storage RLS policies (listed as manual steps; they live in
+  `pg_catalog.pg_policy`, not `storage.policies`, and the stack seeds its own)
+
+Under the walking-skeleton principle, **storage bucket definitions and vault secrets
+are migrated** (Phase 3 and Phase 5) — both are feasible without breaking the
+read-only-source invariant, so they are no longer non-goals.
 
 ---
 
@@ -41,9 +45,12 @@ of it deeply. Incomplete, but never silently incomplete.
 | Roles | `anon`, `authenticated`, `service_role` recreated; custom roles best-effort |
 | Auth users | Migrated with UUIDs preserved — users must log in again |
 | Auth configuration | Manual, printed as a checklist |
-| Storage objects | Copied — no reconciliation, no bucket config |
-| Edge Functions | Not migrated — listed as manual steps |
-| Cron jobs, webhooks | Not migrated — listed as manual steps |
+| Storage bucket definitions | Migrated (data-only `storage.buckets` restore, before object copy) |
+| Storage objects | Copied — no per-bucket RLS policy reconciliation |
+| Storage per-bucket RLS policies | Manual (in `pg_catalog.pg_policy`) |
+| Vault secrets | Migrated, re-encrypted on the target via `vault.create_secret`; skipped (non-fatal) if the source cannot decrypt |
+| Edge Functions | Not migrated — code not retrievable from Cloud; listed as manual steps |
+| Cron jobs, webhooks | Carried over best-effort by the schema dump (`cron.job`, `supabase_webhooks.hooks`) — verify |
 | Downtime | A maintenance window, accepted and documented |
 | Restartability | None. A failure means starting over |
 
@@ -141,26 +148,37 @@ Phase 0: Preflight
 Phase 1: Database — schema + data
   ├─ pg_dump source (per-schema, custom format)
   │     flags: --format=custom --no-owner --no-privileges --schema=<name>
-  │     + --schema=public --schema=auth --schema=storage --schema=_realtime
-  │       --schema=graphql_public --schema=extensions --schema=pgsodium
-  │       (best-effort: missing schemas are skipped with a warning, not fatal)
+  │     + discovered user schemas only (Supabase-managed schemas excluded)
   ├─ pg_restore into target (DSN via --dbname=, archive file as positional)
-  │     flags: --dbname=<target_dsn> --no-owner --no-privileges
-  │            --clean --if-exists --exit-on-error
-  └─ on failure: warn() + add to runtime notes (non-fatal per schema)
+  └─ on failure: warn() + add to runtime notes (non-fatal)
 
 Phase 2: Auth users (UUIDs preserved)
-  ├─ pg_dump auth.users auth.identities from source (data-only, INSERT copy)
-  ├─ pg_restore into target (DSN via --dbname=, archive file as positional)
+  ├─ pg_dump auth.users auth.identities from source (data-only)
+  ├─ pg_restore into target
   └─ NOTE: users must log in again (password hashes migrate, but sessions do not)
 
-Phase 3: Storage objects (rclone copy)
+Phase 3: Storage bucket definitions (MUST precede the object copy)
+  ├─ pg_dump storage.buckets from source (data-only)
+  ├─ pg_restore into target
+  └─ if absent, object copy hits NoSuchBucket on a fresh instance
+
+Phase 4: Storage objects (rclone copy)
   ├─ configure rclone remote for source S3 endpoint (read-only)
   ├─ configure rclone remote for target S3 endpoint
   ├─ rclone copy source:bucket target:bucket --progress=no
-  └─ on failure: warn (storage is best-effort at this layer) + add to manual report
+  └─ on failure: warn (storage is best-effort) + add to manual report
 
-Phase 4: Manual-steps report
+Phase 5: Vault secrets (re-encrypted on the target)
+  ├─ preflight: SELECT count(*) FROM vault.decrypted_secrets on source (read-only)
+  │     on failure (source cannot decrypt) → warn + skip + manual note, continue
+  ├─ SELECT name, decrypted_secret, description FROM vault.decrypted_secrets
+  │     (read-only on source)
+  ├─ build SQL: SELECT vault.create_secret(...) for each secret
+  │     (encrypts with the TARGET's root key)
+  ├─ psql -f against target (re-creates + re-encrypts secrets)
+  └─ on target failure: warn + add to manual report
+
+Phase 6: Manual-steps report
   ├─ print a fixed checklist of everything NOT migrated
   └─ exit 0
 ```
@@ -171,9 +189,12 @@ Phase 4: Manual-steps report
 - `rclone copy` (not `sync`, not `move`) — source is never mutated.
 - A preflight assertion `source.db_url != target.db_url` prevents the catastrophic
   case of pointing both ends at the same database.
-- The script never issues `psql` against the source at all — the only `psql`
-  calls are read-only `SELECT count(*)` preflight probes against the **target**
-  (to verify it is empty). The source is touched only by `pg_dump` (read-only).
+- All `psql` calls against the source are **read-only `SELECT`s only**:
+  - the empty-target preflight probes (against the **target**), and
+  - the vault phase reads `vault.decrypted_secrets` via `SELECT` (source) before
+    re-creating secrets on the **target** with `vault.create_secret`.
+  The source is otherwise touched only by `pg_dump` (read-only). Every write
+  (`pg_restore`, `rclone`, `psql -f` with `vault.create_secret`) targets the target DSN.
 
 ### Non-empty-target refusal
 
@@ -210,29 +231,37 @@ Template (printed verbatim, with runtime substitutions):
    - [ ] Re-configure SMTP settings (already in env/supabase.yml — verify)
    - [ ] Re-create any MFA / SAML / hooks configuration
 
-2. EDGE FUNCTIONS (not migrated)
-   - [ ] List your functions: supabase functions list --project-ref <ref>
-   - [ ] Deploy each: supabase functions deploy <name> --project-ref <self-hosted-ref>
-         (or copy the source and deploy via the self-hosted CLI)
+2. EDGE FUNCTIONS (not migrated automatically — code is not retrievable from Cloud)
+   - [ ] Copy your function source from your project repo (supabase/functions/<name>/index.ts)
+   - [ ] Deploy each onto the self-hosted host: copy the folder into
+         <supabase_path>/volumes/functions/ and: docker compose restart functions
+   - [ ] Re-create any function secrets/env vars as a .env.functions override
 
-3. CRON JOBS (not migrated)
-   - [ ] Re-create pg_cron jobs: SELECT cron.schedule(...) for each job
-   - [ ] Source list: SELECT * FROM cron.job;
+3. CRON JOBS (migrated best-effort via the schema dump)
+   - [x] pg_cron job definitions carried over by the schema+data restore
+   - [ ] Verify on the target: SELECT * FROM cron.job;
 
-4. WEBHOOKS (not migrated)
-   - [ ] Re-create any database webhooks (Dashboard → Database → Webhooks)
+4. WEBHOOKS (migrated best-effort via the schema dump)
+   - [x] Database webhook definitions (supabase_webhooks.hooks) carried over
+   - [ ] Verify the hooks were reinstalled onto their tables
 
-5. STORAGE BUCKET CONFIGURATION (not migrated — objects only)
-   - [ ] Re-create bucket definitions (public/private, file size limits, MIME types)
-   - [ ] Re-create any per-bucket RLS policies
+5. STORAGE BUCKET CONFIGURATION (definitions migrated; RLS policies manual)
+   - [x] Bucket definitions (public/private, size limits, MIME types) — migrated
+   - [ ] Re-create any per-bucket RLS policies (not migrated)
 
-6. CLIENT ENV VARS (operator action)
+6. VAULT (re-encrypted on the target, when the source could decrypt)
+   - [ ] If the vault phase was skipped (source could not decrypt), re-create
+         secrets manually in the self-hosted Dashboard → Database → Vault
+   - [ ] Note: secrets were re-encrypted with the target root key; the original
+         key_id is not preserved (functionally equivalent)
+
+7. CLIENT ENV VARS (operator action)
    - [ ] Update your application's NEXT_PUBLIC_SUPABASE_URL / VITE_SUPABASE_URL
          to point at the self-hosted API URL
    - [ ] Update NEXT_PUBLIC_SUPABASE_ANON_KEY / VITE_SUPABASE_ANON_KEY
          to the self-hosted anon key (from env/supabase.yml)
 
-7. USERS MUST LOG IN AGAIN
+8. USERS MUST LOG IN AGAIN
    - [ ] Notify users that sessions are invalidated; password hashes migrated,
          so existing passwords still work.
 

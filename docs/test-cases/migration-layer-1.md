@@ -7,9 +7,10 @@ Issue: #99
 ## Scope
 
 Layer 1 is the walking skeleton: schema+data, auth users (UUIDs preserved),
-storage objects (copy only), and a manual-steps report. No verification,
-dry-run-only side effects, no resumability, no auth-config import. The script
-is read-only against the source and refuses a non-empty target.
+storage bucket definitions + objects, vault secrets (re-encrypted on the target),
+and a manual-steps report. No verification, dry-run-only side effects, no
+resumability, no auth-config import. The script is read-only against the source
+and refuses a non-empty target.
 
 Tests are shell-level (mirroring `tests/test-setup.sh`): they sandbox the
 script and stub `pg_dump`, `pg_restore`, `rclone`, and `psql` so they run
@@ -79,9 +80,9 @@ command is ever issued against the source DSN).
 ### TC-MIG-012: Manual-steps report is always printed
 - **Given**: any successful run (happy path)
 - **When**: the script completes
-- **Then**: stdout contains the "MANUAL STEPS" header and all 7 numbered sections
-  (auth config, edge functions, cron jobs, webhooks, storage bucket config,
-  client env vars, users must log in again)
+- **Then**: stdout contains the "MANUAL STEPS" header and all numbered sections
+  (auth config, edge functions, cron/webhooks [migrated best-effort], storage bucket
+  config, vault, client env vars, users must log in again)
 
 ### TC-MIG-013: Read-only-source invariant — no write command against source
 - **Given**: full happy path with stubs that log their argv
@@ -127,3 +128,33 @@ command is ever issued against the source DSN).
 - **Given**: full happy path with stubs
 - **When**: the script runs
 - **Then**: `pg_restore` is invoked with the target DSN, never the source DSN
+
+### TC-MIG-021: Storage bucket definitions are dumped before the object copy
+- **Given**: full happy path with stubs that log a shared invocation timeline
+- **When**: the script runs
+- **Then**: the `pg_dump` carrying `--table=storage.buckets` appears in the shared
+  timeline **before** the `rclone copy` invocation (Phase 3 precedes Phase 4)
+
+### TC-MIG-022: Storage bucket restore is data-only + read-only on source
+- **Given**: full happy path with stubs
+- **When**: the script runs
+- **Then**: the bucket `pg_dump` uses `--data-only --no-owner --no-privileges
+  --table=storage.buckets`, and no `pg_restore` ever references the source DSN
+
+### TC-MIG-023: Vault migration skipped (non-fatal) when source cannot decrypt
+- **Given**: stubbed `psql` fails on `SELECT count(*) FROM vault.decrypted_secrets`
+- **When**: `bash migrate.sh --config env/migrate.yml --yes`
+- **Then**: exits 0, prints "vault migration skipped", and the manual report's
+  RUNTIME NOTES explains that secrets must be re-created manually
+
+### TC-MIG-024: Vault secrets re-encrypted on the target via vault.create_secret
+- **Given**: stubbed `psql` returns one secret from `vault.decrypted_secrets`
+- **When**: `bash migrate.sh --config env/migrate.yml --yes`
+- **Then**: exits 0 with "vault secrets re-created on the target", and the
+  read-only-source invariant holds (the vault `SELECT` against the source is a
+  read, never a write)
+
+### TC-MIG-025: No vault secrets produces a clean no-op
+- **Given**: stubbed `psql` returns 0 secrets
+- **When**: `bash migrate.sh --config env/migrate.yml --yes`
+- **Then**: exits 0 with "no vault secrets to migrate" (clean skip, no error)
