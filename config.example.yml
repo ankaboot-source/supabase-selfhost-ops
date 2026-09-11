@@ -30,7 +30,11 @@ required:
 
   # Supabase API endpoint — the public URL of this Supabase stack.
   # Used by Studio and client SDKs. Must point at this server's domain.
-  api_external_url: https://sb.example.com
+  # NOTE: upstream v0.7.0+ uses this value DIRECTLY as the Auth issuer / OAuth
+  # base, so it MUST include the /auth/v1 path suffix (e.g.
+  # https://sb.example.com/auth/v1). The supabase_domain field below stays
+  # pathless (it drives TLS certs + Postgres SSL cert generation).
+  api_external_url: https://sb.example.com/auth/v1
 
   # Domain for the Supabase dashboard (Studio). Routed by the reverse proxy.
   supabase_domain: sb.example.com

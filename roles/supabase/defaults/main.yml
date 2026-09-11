@@ -1,17 +1,18 @@
 ---
 
-sb_studio_version: supabase/studio:2026.06.03-sha-0bca601
-sb_kong_version: kong/kong:3.9.1
-sb_gotrue_version: supabase/gotrue:v2.189.0
-sb_rest_version: postgrest/postgrest:v14.12
-sb_realtime_version: supabase/realtime:v2.102.3
-sb_storage_version: supabase/storage-api:v1.60.4
-sb_imgproxy_version: darthsim/imgproxy:v3.30.1
-sb_meta_version: supabase/postgres-meta:v0.96.6
-sb_functions_version: supabase/edge-runtime:v1.74.0
+sb_studio_version: supabase/studio:2026.09.07-sha-7996410
+sb_envoy_version: envoyproxy/envoy:v1.39.1
+sb_kong_version: kong/kong:3.9.3
+sb_gotrue_version: supabase/gotrue:v2.196.0
+sb_rest_version: postgrest/postgrest:v14.17
+sb_realtime_version: supabase/realtime:v2.134.10
+sb_storage_version: supabase/storage-api:v1.74.0
+sb_imgproxy_version: darthsim/imgproxy:v3.31.4
+sb_meta_version: supabase/postgres-meta:v0.99.0
+sb_functions_version: supabase/edge-runtime:v1.76.2
 sb_db_version: supabase/postgres:17.6.1.136
-sb_supavisor_version: supabase/supavisor:2.9.5
-sb_logflare_version: supabase/logflare:1.43.1
+sb_supavisor_version: supabase/supavisor:2.9.12
+sb_logflare_version: supabase/logflare:1.50.10
 sb_vector_version: timberio/vector:0.53.0-alpine
 caddy_cert_base_path: "/home/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
 postgres_cert_path: "/opt/postgres-certs"

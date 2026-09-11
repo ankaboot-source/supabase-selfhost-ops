@@ -99,9 +99,16 @@ POOLER_TENANT_ID={{ pooler_tenant_id }}
 POOLER_DB_POOL_SIZE=5
 
 ############
-# API Proxy - Configuration for the Kong Reverse proxy.
+# API Proxy - Configuration for the Envoy Reverse proxy (default gateway).
+# Kong is available as a manual fallback via docker-compose.kong.yml.
 ############
 
+# Host port the API gateway (Envoy by default) listens on.
+API_GW_HTTP_PORT=8000
+
+# Kong override only (docker-compose.kong.yml). KONG_HTTPS_PORT is Kong's
+# built-in HTTPS listener; KONG_HTTP_PORT is kept as a fallback for
+# API_GW_HTTP_PORT so existing .env files continue to work.
 KONG_HTTP_PORT=8000
 KONG_HTTPS_PORT=8443
 
@@ -134,6 +141,8 @@ SITE_URL={{ site_url }}
 ADDITIONAL_REDIRECT_URLS={{ additional_redirect_urls }}
 JWT_EXPIRY=3600
 DISABLE_SIGNUP=false
+# API_EXTERNAL_URL now includes the /auth/v1 path prefix (used directly as the
+# Auth issuer / OAuth base). See config.example.yml required.api_external_url.
 API_EXTERNAL_URL={{ api_external_url }}
 
 ## Mailer Config
@@ -297,7 +306,7 @@ GOOGLE_PROJECT_ID=GOOGLE_PROJECT_ID
 GOOGLE_PROJECT_NUMBER=GOOGLE_PROJECT_NUMBER
 
 #REDIRECT_URI
-REDIRECT_URI={{ api_external_url }}/auth/v1/callback
+REDIRECT_URI={{ api_external_url }}/callback
 
 ############
 # Storage - Configuration for Storage

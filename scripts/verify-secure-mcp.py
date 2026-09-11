@@ -10,6 +10,7 @@ from jinja2 import Environment, FileSystemLoader
 
 ROLE_TEMPLATES = "roles/supabase/templates"
 KONG_TEMPLATE = "kong-supabase.yml.j2"
+ENVOY_LDS_TEMPLATE = "lds.template.yaml.j2"
 LOGS_COMPOSE_TEMPLATE = "docker-compose-logs.yml.j2"
 VECTOR_TEMPLATE = "vector-logs.yml.j2"
 CADDY_TEMPLATES = "roles/caddy/templates"
@@ -23,6 +24,16 @@ def render_kong(trim_blocks=False, lstrip_blocks=False, **vars):
         lstrip_blocks=lstrip_blocks,
     )
     return env.get_template(KONG_TEMPLATE).render(**vars)
+
+
+def render_envoy_lds(trim_blocks=False, lstrip_blocks=False, **vars):
+    env = Environment(
+        loader=FileSystemLoader(ROLE_TEMPLATES),
+        keep_trailing_newline=True,
+        trim_blocks=trim_blocks,
+        lstrip_blocks=lstrip_blocks,
+    )
+    return env.get_template(ENVOY_LDS_TEMPLATE).render(**vars)
 
 
 def render_logs(trim_blocks=False, lstrip_blocks=False, **vars):
@@ -176,6 +187,70 @@ def main():
     assert_true("10.0.0.5" in allow_custom, "custom allow list includes 10.0.0.5")
     assert_true("10.0.0.0/24" in allow_custom, "custom allow list includes 10.0.0.0/24")
     assert_true("172.28.0.1" in allow_custom, "custom allow list includes 172.28.0.1")
+
+    # Envoy gateway (default). lds.template.yaml.j2 /mcp route must:
+    #   - render to valid YAML under every trim_blocks/lstrip_blocks combo
+    #   - use an ALLOW RBAC with direct_remote_ip principals matching
+    #     mcp_allowed_ips (Docker source-NATs host traffic to the pinned
+    #     bridge gateway 172.28.0.1)
+    #   - contain NO basic_auth filter (dashboard is Caddy-SSO-fronted)
+    for trim, lstrip in [(False, False), (True, False), (False, True), (True, True)]:
+        rendered = render_envoy_lds(trim_blocks=trim, lstrip_blocks=lstrip, **defaults)
+        doc = yaml.safe_load(rendered)
+        assert_true(
+            isinstance(doc, dict) and "resources" in doc,
+            f"rendered lds.template.yaml is a YAML mapping (trim_blocks={trim}, lstrip_blocks={lstrip})",
+        )
+    rendered = render_envoy_lds(**defaults)
+    doc = yaml.safe_load(rendered)
+    assert_true(isinstance(doc, dict), "rendered lds.template.yaml is a YAML mapping")
+
+    # Reject any leftover basic_auth
+    assert_true("basic_auth" not in rendered, "lds.template.yaml contains NO basic_auth filter")
+
+    # Walk the virtual host routes to find the /mcp route and its RBAC principals
+    def _mcp_principals(listener_doc):
+        vhosts = (
+            listener_doc["resources"][0]["filter_chains"][0]["filters"][0]
+            ["typed_config"]["route_config"]["virtual_hosts"]
+        )
+        for vh in vhosts:
+            for route in vh.get("routes", []):
+                match = route.get("match", {})
+                if match.get("prefix") == "/mcp":
+                    tpc = route.get("typed_per_filter_config", {})
+                    rbac = tpc.get("envoy.filters.http.rbac", {}).get("rbac", {})
+                    rules = rbac.get("rules", {})
+                    policies = rules.get("policies", {})
+                    allow_mcp = policies.get("allow_mcp")
+                    return rules.get("action"), (allow_mcp or {}).get("principals", [])
+        return None, []
+
+    action, principals = _mcp_principals(doc)
+    assert_true(action == "ALLOW", "Envoy /mcp RBAC action is ALLOW")
+    addrs = [
+        p["direct_remote_ip"]["address_prefix"]
+        for p in principals
+        if "direct_remote_ip" in p
+    ]
+    assert_true(
+        sorted(addrs) == sorted(defaults["mcp_allowed_ips"]),
+        f"Envoy /mcp allow principals match mcp_allowed_ips {defaults['mcp_allowed_ips']}",
+    )
+
+    # Custom allowed IPs honored by Envoy
+    rendered_custom = render_envoy_lds(**custom)
+    doc_custom_e = yaml.safe_load(rendered_custom)
+    _action, principals_custom = _mcp_principals(doc_custom_e)
+    addrs_custom = {
+        p["direct_remote_ip"]["address_prefix"]
+        for p in principals_custom
+        if "direct_remote_ip" in p
+    }
+    assert_true(
+        sorted(addrs_custom) == sorted(custom["mcp_allowed_ips"]),
+        "Envoy /mcp allow principals honor custom mcp_allowed_ips",
+    )
 
     # TC-MCP-010: no /mcp path in Caddy example projects
     # Parse env/supabase.yml and inspect the projects' upstream paths.
