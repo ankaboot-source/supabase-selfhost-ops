@@ -18,6 +18,76 @@
     group: "{{ deploy_user }}"
     recurse: yes
 
+# --- Supabase CLI (optional, best-effort) ------------------------------------
+# The CLI is only needed for the edge-function migration phase of migrate.sh
+# (functions list/download + secrets list). Its absence must never block the
+# stack deploy, so the whole block is best-effort: a failure (download URL
+# changed, GitHub API unreachable, broken package) warns and skips instead of
+# failing the run. migrate.sh re-checks for the binary and skips its phases if
+# it is missing.
+- name: Check if Supabase CLI is already installed
+  ansible.builtin.command: which supabase
+  register: sb_cli_present
+  changed_when: false
+  failed_when: false
+
+- name: Resolve latest Supabase CLI release from GitHub
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/supabase/cli/releases/latest"
+    return_content: true
+  register: sb_cli_latest
+  when: sb_cli_present.rc != 0
+  ignore_errors: true
+
+- name: Determine CLI package architecture
+  ansible.builtin.set_fact:
+    sb_cli_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+    sb_cli_tag: "{{ (sb_cli_latest.json.tag_name | default('')) }}"
+  when: sb_cli_present.rc != 0 and sb_cli_latest is defined and sb_cli_latest.content is defined
+
+- name: Download latest Supabase CLI .deb package
+  ansible.builtin.get_url:
+    url: "https://github.com/supabase/cli/releases/download/{{ sb_cli_tag }}/supabase_{{ sb_cli_tag | regex_replace('^v', '') }}_linux_{{ sb_cli_arch }}.deb"
+    dest: "/tmp/supabase_cli.deb"
+    mode: "0644"
+  when:
+    - sb_cli_present.rc != 0
+    - sb_cli_tag | string | length > 2
+  register: sb_cli_download
+  ignore_errors: true
+
+- name: Install Supabase CLI .deb package
+  ansible.builtin.apt:
+    deb: /tmp/supabase_cli.deb
+  when:
+    - sb_cli_download is defined
+    - sb_cli_download.failed | default(false) | bool == false
+  ignore_errors: true
+
+- name: Clean up downloaded Supabase CLI package
+  ansible.builtin.file:
+    path: /tmp/supabase_cli.deb
+    state: absent
+  when: sb_cli_download is defined and sb_cli_download.dest is defined
+
+- name: Verify Supabase CLI install (best-effort — never blocks deploy)
+  ansible.builtin.command: supabase --version
+  register: sb_cli_verify
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  when: sb_cli_download is defined and (sb_cli_download.failed | default(false) | bool) == false
+
+- name: Note if Supabase CLI could not be installed
+  ansible.builtin.debug:
+    msg: >-
+      Supabase CLI is not installed (download or package install failed).
+      The self-hosted stack will still deploy; only the edge-function migration
+      phase of migrate.sh is unavailable. Install manually or fix the download URL.
+  when:
+    - sb_cli_present.rc != 0
+    - (sb_cli_download.failed | default(false)) | bool
+
 - name: Ensure /var/log/postgresql directory exists
   ansible.builtin.file:
     path: /var/log/postgresql
@@ -129,6 +199,16 @@
     - { src: "docker-entrypoint.sh", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/volumes/api/envoy/docker-entrypoint.sh", mode: '0755' }
     - { src: "env-supabase", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/.env", mode: '0664' }
     - { src: "start-supabase.sh", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/start-supabase.sh", mode: '0755' }
+
+# .env.functions is the edge-function secret override consumed by the
+# `functions` service's env_file. Rendered empty by default so compose resolves
+# the env_file reference even when migrate.sh's edge-function secrets phase has
+# never run. migrate.sh appends `NAME=` placeholder lines for the operator to fill.
+- name: Create default empty .env.functions override
+  ansible.builtin.copy:
+    dest: "/home/{{ deploy_user }}/{{ supabase_path }}/.env.functions"
+    content: ""
+    mode: "0664"
 
 - name: Create backup network if needed
   shell: |

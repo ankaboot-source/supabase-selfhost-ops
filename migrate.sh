@@ -3,9 +3,10 @@
 # migrate.sh — Migrate a Supabase Cloud project into a self-hosted instance.
 # =============================================================================
 # Walking skeleton: schema+data, auth users (UUIDs preserved), storage bucket
-# definitions + objects, vault secrets (re-encrypted on the target), and a
-# manual-steps report. Read-only against the source. Refuses a non-empty target.
-# No resumability — a failure means starting over.
+# definitions + objects, vault secrets (re-encrypted on the target), edge
+# functions (code downloaded read-only from Cloud; secret VALUES are manual),
+# and a manual-steps report. Read-only against the source. Refuses a non-empty
+# target. No resumability — a failure means starting over.
 #
 # The script is ALWAYS read-only against the source:
 #   - pg_dump (no write flags) reads the source.
@@ -72,6 +73,9 @@ The script:
   - Restores storage bucket definitions (required for the object copy)
   - Copies storage objects via rclone (read-only against source)
   - Migrates vault secrets, re-encrypted on the target
+  - Downloads edge-function code from Cloud (read-only) and deploys it into the
+    self-hosted functions mount; stages edge-function secret NAMES in
+    .env.functions for the operator to fill in (values are not retrievable)
   - Prints a manual-steps report listing everything NOT migrated
 
 INVARIANT: read-only against the source project. Always. At every layer.
@@ -133,6 +137,14 @@ else:
 PYEOF
 }
 
+# Reads a boolean from the config, defaulting to false when unset/empty.
+# Usage: cfg_bool "functions.enabled"
+cfg_bool() {
+  local val
+  val="$(cfg_get "$1")"
+  [[ -n "$val" && "$val" == "true" ]]
+}
+
 # ─── Config validation ───────────────────────────────────────────────────────
 log "Validating $CONFIG_FILE…"
 
@@ -171,6 +183,7 @@ PG_DUMP="$(cfg_get "tools.pg_dump")";    PG_DUMP="${PG_DUMP:-pg_dump}"
 PG_RESTORE="$(cfg_get "tools.pg_restore")"; PG_RESTORE="${PG_RESTORE:-pg_restore}"
 RCLONE="$(cfg_get "tools.rclone")";      RCLONE="${RCLONE:-rclone}"
 PSQL="$(cfg_get "tools.psql")";          PSQL="${PSQL:-psql}"
+SUPABASE="$(cfg_get "tools.supabase")";  SUPABASE="${SUPABASE:-supabase}"
 
 # DSN scheme validation
 SRC_DB_URL="$(cfg_get "source.db_url")"
@@ -193,6 +206,26 @@ for bin in "$PG_DUMP" "$PG_RESTORE" "$RCLONE" "$PSQL"; do
   command -v "$bin" >/dev/null 2>&1 || die "required binary not found: $bin"
 done
 ok "All required binaries found."
+
+# ─── Edge-function migration config ──────────────────────────────────────────
+# Optional and self-skipping: every edge-function phase degrades gracefully
+# (CLI missing, empty function list, secrets-list failure) instead of failing.
+SRC_PROJECT_REF="$(cfg_get "source.project_ref")"
+
+FUNCTIONS_ENABLED=0
+if cfg_bool "functions.enabled" || [[ -z "$(cfg_get "functions.enabled")" ]]; then
+  FUNCTIONS_ENABLED=1   # default true
+fi
+FUNCTIONS_DIR="$(cfg_get "functions.target_dir")"
+FUNCTIONS_DIR="${FUNCTIONS_DIR:-supabase/docker/volumes/functions}"
+
+# Resolve the (possibly relative) functions mount to an absolute path. The
+# self-hosted repo lives under $HOME in this stack, and target_dir uses
+# supabase/... (relative to $HOME) by default.
+FUNCTIONS_ABS="${FUNCTIONS_DIR/\$HOME/$HOME}"
+[[ "$FUNCTIONS_ABS" != /* ]] && FUNCTIONS_ABS="$HOME/$FUNCTIONS_ABS"
+# Compose working dir = functions mount dir minus trailing /volumes/functions.
+SUPABASE_COMPOSE_DIR="${FUNCTIONS_ABS%/volumes/functions}"
 
 # Capture runtime notes for the manual-steps report.
 RUNTIME_NOTES=()
@@ -227,7 +260,9 @@ if [[ $DRY_RUN -eq 1 ]]; then
   log "  Phase 3: pg_dump storage.buckets → pg_restore target (bucket definitions)"
   log "  Phase 4: rclone copy source-storage → target-storage (read-only against source)"
   log "  Phase 5: vault secrets → re-encrypted on the target via vault.create_secret"
-  log "  Phase 6: print manual-steps report"
+  log "  Phase 6: edge functions → downloaded from Cloud (read-only), deployed into ${FUNCTIONS_ABS}"
+  log "  Phase 7: edge-function secrets → secret NAMES written to ${SUPABASE_COMPOSE_DIR}/.env.functions (values operator-supplied)"
+  log "  Phase 8: print manual-steps report"
   ok "Dry run complete. Re-run without --dry-run to migrate."
   exit 0
 fi
@@ -496,7 +531,154 @@ PY
   rm -f "$VAULT_ROWS" "$VAULT_SQL"
 fi
 
-# ─── Phase 6: Manual-steps report ────────────────────────────────────────────
+# ─── Phase 6: Edge functions (code) — downloaded read-only from Cloud ────────
+# Supabase Cloud supports downloading the deployed edge-function bundle via the
+# CLI (`supabase functions download`), so the CODE is retrievable. Deployment to
+# a self-hosted instance is filesystem-based — copy into the functions mount and
+# restart the container (`supabase functions deploy` targets Cloud, NOT here).
+log "Phase 6: migrating edge functions (code downloaded read-only from Cloud)…"
+
+if [[ $FUNCTIONS_ENABLED -eq 0 ]]; then
+  ok "Phase 6 skipped (functions.enabled is false)."
+  add_note "Edge functions skipped (functions.enabled: false)."
+elif ! command -v "$SUPABASE" >/dev/null 2>&1; then
+  warn "Supabase CLI not found — skipping edge-function code migration."
+  warn "  Install it (the supabase role does so best-effort) or run 'supabase login' / set SUPABASE_ACCESS_TOKEN."
+  add_note "Edge functions skipped: Supabase CLI not found at ${SUPABASE}."
+else
+  # CLI auth: prefer the config token; otherwise fall back to an existing
+  # supabase login session. Both are read-only pathways against the source.
+  SB_AT="$(cfg_get "source.access_token")"
+  if [[ -n "$SB_AT" && "$SB_AT" != "changeit" ]]; then
+    export SUPABASE_ACCESS_TOKEN="$SB_AT"
+  fi
+
+  # Enumerate function slugs. Parses either a CLI table (SLUG is the 2nd token
+  # on non-header rows) or a bare one-slug-per-line list.
+  FUNC_SRC="$(mktemp -d -t migrate-functions-XXXXXX)"
+  readarray -t FUNC_SLUGS < <("$SUPABASE" functions list --project-ref "$SRC_PROJECT_REF" \
+      2>"$LOG_DIR/fn-list.err" | python3 -c '
+import sys
+for line in sys.stdin:
+    t = line.split()
+    if not t:
+        continue
+    if len(t) >= 2 and t[0] != "ID":
+        print(t[1])
+    elif len(t) == 1:
+        print(t[0])
+')
+  if [[ ${#FUNC_SLUGS[@]} -eq 0 ]]; then
+    ok "Phase 6 complete — no edge functions on the source to migrate."
+  else
+    # Deduplicate, drop empties.
+    readarray -t FUNC_SLUGS < <(printf '%s\n' "${FUNC_SLUGS[@]}" | awk '!seen[$0]++ && $0 != ""')
+    log "  downloading ${#FUNC_SLUGS[@]} edge function(s): ${FUNC_SLUGS[*]}"
+    downloaded=0
+    for fn in "${FUNC_SLUGS[@]}"; do
+      [[ -z "$fn" ]] && continue
+      if ( cd "$FUNC_SRC" && "$SUPABASE" functions download "$fn" --project-ref "$SRC_PROJECT_REF" \
+            >/dev/null 2>"$LOG_DIR/fn-dl-$fn.err" ); then
+        downloaded=$((downloaded + 1))
+      else
+        warn "  download of '$fn' failed — see $LOG_DIR/fn-dl-$fn.err"
+        add_note "Edge function download failed for '$fn'. See $LOG_DIR/fn-dl-$fn.err."
+      fi
+    done
+
+    if [[ $downloaded -gt 0 ]]; then
+      mkdir -p "$FUNCTIONS_ABS"
+      copied=0
+      for fn in "${FUNC_SLUGS[@]}"; do
+        [[ -z "$fn" ]] && continue
+        # The CLI writes to ./supabase/functions/<slug> relative to its CWD (a
+        # temp dir here); also accept a bare ./<slug> for stub/edge cases.
+        src_dir="$FUNC_SRC/supabase/functions/$fn"
+        [[ -d "$src_dir" ]] || src_dir="$FUNC_SRC/$fn"
+        [[ -d "$src_dir" ]] || continue
+        mkdir -p "$FUNCTIONS_ABS/$fn"
+        cp -R "$src_dir/." "$FUNCTIONS_ABS/$fn/"
+        copied=$((copied + 1))
+      done
+      log "  copied $copied function(s) into ${FUNCTIONS_ABS}"
+
+      # Restart the functions container so the edge-runtime serves the new code
+      # (filesystem-based deploy — this is how self-hosted deploys work).
+      if ! command -v docker >/dev/null 2>&1; then
+        warn "docker not found — functions deployed to disk but not loaded into a container."
+        add_note "docker not found; functions copied to ${FUNCTIONS_ABS} but the container was not restarted."
+      elif docker compose -f "${SUPABASE_COMPOSE_DIR}/docker-compose-supabase.yml" restart functions \
+            >/dev/null 2>"$LOG_DIR/fn-restart.err"; then
+        ok "Edge functions downloaded and deployed; functions service restarted."
+      else
+        warn "functions service restart failed — see $LOG_DIR/fn-restart.err"
+        add_note "functions restart failed. See $LOG_DIR/fn-restart.err. Run manually: docker compose -f ${SUPABASE_COMPOSE_DIR}/docker-compose-supabase.yml restart functions"
+      fi
+    fi
+  fi
+  rm -rf "$FUNC_SRC"
+fi
+
+# ─── Phase 7: Edge-function secrets (names only — values are not retrievable) ─
+# Secret VALUES are write-only in Supabase Cloud: `secrets list` returns NAMES
+# only. So this phase stages each secret name as an empty `NAME=` entry in the
+# self-hosted <supabase_path>/.env.functions (consumed by the functions service's
+# env_file), and the manual-steps report asks the operator to fill in the values
+# and recreate the container.
+log "Phase 7: migrating edge-function secrets (names staged; values are operator-supplied)…"
+
+if [[ $FUNCTIONS_ENABLED -eq 0 ]]; then
+  ok "Phase 7 skipped (functions.enabled is false)."
+elif ! command -v "$SUPABASE" >/dev/null 2>&1; then
+  warn "Supabase CLI not found — skipping edge-function secrets (manual step)."
+  add_note "Edge-function secrets skipped: Supabase CLI not found. Re-create them manually."
+else
+  # Same token handling as Phase 6.
+  SB_AT="$(cfg_get "source.access_token")"
+  if [[ -n "$SB_AT" && "$SB_AT" != "changeit" ]]; then
+    export SUPABASE_ACCESS_TOKEN="$SB_AT"
+  fi
+
+  readarray -t SECRET_NAMES < <("$SUPABASE" secrets list --project-ref "$SRC_PROJECT_REF" \
+      2>"$LOG_DIR/sec-list.err" | python3 -c '
+import sys
+for line in sys.stdin:
+    t = line.split()
+    if not t:
+        continue
+    if len(t) >= 2 and t[0] != "DIGEST":
+        print(t[1])
+    elif len(t) == 1:
+        print(t[0])
+')
+  ENV_FUNCS="$SUPABASE_COMPOSE_DIR/.env.functions"
+  if [[ ${#SECRET_NAMES[@]} -eq 0 ]]; then
+    ok "Phase 7 complete — no edge-function secrets to stage."
+  else
+    if [[ ! -f "$ENV_FUNCS" ]]; then
+      mkdir -p "$SUPABASE_COMPOSE_DIR"
+      touch "$ENV_FUNCS"
+    fi
+    appended=0
+    for name in "${SECRET_NAMES[@]}"; do
+      [[ -z "$name" ]] && continue
+      # Never clobber an existing entry (an earlier run may have set a value).
+      if grep -qE "^${name}=" "$ENV_FUNCS"; then
+        continue
+      fi
+      printf '%s=\n' "$name" >> "$ENV_FUNCS"
+      appended=$((appended + 1))
+    done
+    if [[ $appended -gt 0 ]]; then
+      ok "Phase 7 complete: ${appended} edge-function secret name(s) staged in ${ENV_FUNCS}."
+      add_note "Edge-function secrets: fill in each ${appended} value(s) in ${ENV_FUNCS} and recreate the functions container: docker compose -f ${SUPABASE_COMPOSE_DIR}/docker-compose-supabase.yml up -d --force-recreate functions"
+    else
+      ok "Phase 7 complete — all edge-function secrets already staged or values present."
+    fi
+  fi
+fi
+
+# ─── Phase 8: Manual-steps report ────────────────────────────────────────────
 print_manual_steps() {
   cat <<'REPORT'
 ================================================================================
@@ -510,11 +692,16 @@ print_manual_steps() {
    - [ ] Re-configure SMTP settings (already in env/supabase.yml — verify)
    - [ ] Re-create any MFA / SAML / hooks configuration
 
-2. EDGE FUNCTIONS (not migrated automatically — code is not retrievable from Cloud)
-   - [ ] Copy your function source from your project repo (supabase/functions/<name>/index.ts)
-   - [ ] Deploy each onto the self-hosted host: copy the folder into
+2. EDGE FUNCTIONS (code migrated automatically; SECRET VALUES are manual)
+   - [x] Function source downloaded from Cloud and deployed into
+         <supabase_path>/volumes/functions/; the functions service was restarted
+   - [ ] Fill in the edge-function SECRET VALUES in
+         <supabase_path>/.env.functions (each staged as NAME=) and recreate the
+         functions container so the env_file is re-read:
+         docker compose -f <supabase_path>/docker-compose-supabase.yml up -d --force-recreate functions
+   - [ ] If any function failed to download, or the Supabase CLI was missing,
+         deploy the affected function(s) manually: copy the folder into
          <supabase_path>/volumes/functions/ and: docker compose restart functions
-   - [ ] Re-create any function secrets/env vars as a .env.functions override
 
 3. CRON JOBS (migrated best-effort via the schema dump)
    - [x] pg_cron job definitions carried over by the schema+data restore
@@ -556,6 +743,6 @@ REPORT
   printf '================================================================================\n'
 }
 
-log "Phase 6: printing manual-steps report…"
+log "Phase 8: printing manual-steps report…"
 print_manual_steps
 ok "Migration complete. Complete the manual steps above to finish."
