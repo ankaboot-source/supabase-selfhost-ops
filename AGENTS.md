@@ -33,7 +33,7 @@ Each role follows Ansible convention:
 Installs Docker Engine (official APT repo), `docker-compose-plugin`, and adds `deploy_user` to the `docker` group. Always runs first as a prerequisite.
 
 ### Role: supabase
-Clones the official Supabase repo, renders the Docker Compose stack, configures Kong (API gateway), sets up SSL certs (from Caddy or self-signed), and starts all Supabase services (Postgres, GoTrue, PostgREST, Realtime, Storage, Edge Functions, Studio, etc.). Six templates: `docker-compose-supabase.yml.j2`, `docker-compose-logs.yml.j2` (Logflare + Vector log-drain override, see below), `vector-logs.yml.j2` (<supabase_path>/volumes/logs/vector.yml — Vector pipeline that routes container logs to Logflare, container names templated with the `deploy_env` suffix), `kong-supabase.yml.j2`, `env-supabase.j2`, `start-supabase.sh.j2`.
+Clones the official Supabase repo, renders the Docker Compose stack, configures the API gateway (**Envoy** by default, `api-gw`/`supabase-envoy`; a Kong fallback override `docker-compose.kong.yml` is also rendered but not active by default), sets up SSL certs (from Caddy or self-signed), and starts all Supabase services (Postgres, GoTrue, PostgREST, Realtime, Storage, Edge Functions, Studio, etc.). Templates: `docker-compose-supabase.yml.j2`, `docker-compose-kong.yml.j2` (Kong fallback override), `docker-compose-logs.yml.j2` (Logflare + Vector log-drain override, see below), `vector-logs.yml.j2` (<supabase_path>/volumes/logs/vector.yml — Vector pipeline that routes container logs to Logflare, container names templated with the `deploy_env` suffix), `kong-supabase.yml.j2` (Kong declarative config, used by the fallback), the four Envoy configs (`envoy.yaml.j2`, `cds.yaml.j2`, `lds.template.yaml.j2`, `docker-entrypoint.sh.j2`), `env-supabase.j2`, `start-supabase.sh.j2`.
 
 The **log drain** (Studio dashboard logging) is a separate compose override: `docker-compose-logs.yml` (analytics/Logflare + vector). It ships in the repo always, but `start-supabase.sh` only boots it when `log_drain_enabled: true` (rendered by setup.sh from `required.enable_logging`, default `true` — set it `false` to disable log drain). The file is always rendered so `down` tears down orphaned analytics/vector when the drain is disabled.
 
@@ -66,15 +66,15 @@ Encrypts a secondary block device with LUKS2 (AES-XTS-512), creates an `ext4` fi
 Most agents default to treating Supabase like the SaaS cloud product. This repo deploys a **self-hosted** stack on a VPS via Ansible, and the runtime shape is different. Read this section before running any command against a deployed instance.
 
 ### Context & Stack Architecture
-- **Topology**: PostgreSQL and all Supabase services (GoTrue, PostgREST, Realtime, Storage, Edge Functions, Studio, Kong, Supavisor) run in Docker Compose on a single host. Caddy runs as a **native systemd service** (apt package, not a container) and acts as the reverse proxy + automatic TLS + OAuth2 SSO gateway (GitHub/GitLab/Generic/Discord).
-- **Monitoring**: Observability is a separate Docker Compose stack — Prometheus, Loki, Grafana, cAdvisor, Node Exporter, Postgres Exporter, Promtail. Logflare/Analytics is opt-in via `required.enable_logging` (default `true`); when disabled, Kong routes for `/analytics/v1/*` stay commented out and the Studio UI logs pane is empty.
+- **Topology**: PostgreSQL and all Supabase services (GoTrue, PostgREST, Realtime, Storage, Edge Functions, Studio, **Envoy** (`api-gw`/`supabase-envoy`), Supavisor) run in Docker Compose on a single host. Caddy runs as a **native systemd service** (apt package, not a container) and acts as the reverse proxy + automatic TLS + OAuth2 SSO gateway (GitHub/GitLab/Generic/Discord). Envoy is the default API gateway (upstream since self-hosted v0.8.0); a Kong fallback override (`docker-compose.kong.yml`) is rendered but not booted by default.
+- **Monitoring**: Observability is a separate Docker Compose stack — Prometheus, Loki, Grafana, cAdvisor, Node Exporter, Postgres Exporter, Promtail. Logflare/Analytics is opt-in via `required.enable_logging` (default `true`); when disabled, the gateway routes for `/analytics/v1/*` stay commented out and the Studio UI logs pane is empty.
 - **Database**: PostgreSQL is bound to `127.0.0.1:5432` only — it is **never exposed to the public internet**. The Supavisor pooler is bound to `127.0.0.1:6543`. Both are reachable from the host loopback, not from outside.
 
 ### Where Things Live on the Host
 | Path | Contents |
 |------|----------|
 | `/home/<deploy_user>/supabase/` | Cloned upstream Supabase repo (chowned to `deploy_user`) |
-| `/home/<deploy_user>/supabase/docker/` | Rendered `docker-compose-supabase.yml`, `.env`, `start-supabase.sh`, Kong config (`volumes/api/kong.yml`) — this is the stack working directory (`supabase_path` var, default `supabase/docker`) |
+| `/home/<deploy_user>/supabase/docker/` | Rendered `docker-compose-supabase.yml`, `.env`, `start-supabase.sh`, Envoy configs (`volumes/api/envoy/`), Kong fallback (`docker-compose.kong.yml` + `volumes/api/kong.yml`) — this is the stack working directory (`supabase_path` var, default `supabase/docker`) |
 | `/home/<deploy_user>/supabase/docker/volumes/functions/` | Edge Function source — each function is a subfolder (`<name>/index.ts`) mounted into the edge-runtime container (`/home/deno/functions`) and Studio (`/app/edge-functions`) |
 | `/opt/postgres-certs/` | Postgres SSL certs (mounted read-only into the db container) |
 | `/var/log/postgresql/` | Postgres logs (host-mounted into the db container — never inside the data dir) |
@@ -119,11 +119,11 @@ Use the direct port (`5432`), not the pooler.
    ```bash
    cd /home/<deploy_user>/supabase/docker && docker compose restart functions
    ```
-3. Verify: `curl https://<domain>/functions/v1/<name>` (Kong routes `/functions/v1/*` to the edge-runtime).
+3. Verify: `curl https://<domain>/functions/v1/<name>` (gateway routes `/functions/v1/*` to the edge-runtime).
 - `supabase functions deploy` targets Supabase **Cloud** projects and does **not** deploy to a self-hosted instance — self-hosted deployment is filesystem-based (copy into `volumes/functions` + restart). Function env vars/secrets live in the compose `environment:` block (or a `.env.functions` override); changing them requires recreating the container, not just restarting.
 
 **Inspect logs & services**:
-1. Resolve container names: `cd /home/<deploy_user>/supabase/docker && docker compose ps` (e.g. `supabase-db`, `supabase-kong`, `supabase-rest`, `supabase-auth`, `supabase-studio`, `supabase-pooler`, `grafana`, `promtail`).
+1. Resolve container names: `cd /home/<deploy_user>/supabase/docker && docker compose ps` (e.g. `supabase-db`, `supabase-envoy`, `supabase-rest`, `supabase-auth`, `supabase-studio`, `supabase-pooler`, `grafana`, `promtail`).
 2. Fetch recent logs: `docker logs --tail 100 <container_name>`.
 3. For HTTP 401/403 on Studio/Grafana (SSO issues): `journalctl -u caddy -n 100 --no-pager` — Caddy is a systemd unit, not a container.
 
@@ -132,7 +132,7 @@ Use the direct port (`5432`), not the pooler.
   ```bash
   cd /home/<deploy_user>/supabase/docker
   docker compose restart rest        # PostgREST (schema cache reload)
-  docker compose restart kong        # Kong gateway
+  docker compose restart api-gw      # Envoy gateway (Kong fallback: `restart kong`)
   docker compose restart auth        # GoTrue
   ```
 - To pick up `.env` / compose changes, `docker compose up -d` alone is **not** reliable — run `start-supabase.sh` (which does `down && up`), or `docker compose down && docker compose up -d` manually.
@@ -158,7 +158,7 @@ These are problems encountered while building this repo, and how they were fixed
 ### Ansible / Jinja2
 - **`environment` clashes with Ansible's reserved keyword** — using it as a variable name silently broke the container-name suffix rendering. Use `deploy_env`. Check against the literal placeholder (`!= 'changeit'`), not truthiness — the placeholder is non-empty.
 - **`{% if %}` blocks leave stray whitespace/newlines in templated compose files** under trim_blocks. Use inline expressions instead: `{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}`.
-- **`{% for %}` block loops collapse onto one line under trim_blocks** and break YAML-only consumers. The Kong template's `ip-restriction` allow list must stay an inline expression (`allow: {{ mcp_allowed_ips }}` renders a YAML flow list) — the previous `{%- for ip in ... %}`/`{%- endfor %}` form mangled `allow:` + `deny: []` onto one line and Kong refused to start (`block sequence entries are not allowed in this context`). `verify-secure-mcp.py` renders under all `trim_blocks`/`lstrip_blocks` combos to catch this class.
+- **`{% for %}` block loops collapse onto one line under trim_blocks** and break YAML-only consumers. The Kong fallback's `ip-restriction` allow list must stay an inline expression (`allow: {{ mcp_allowed_ips }}` renders a YAML flow list). The Envoy `lds.template.yaml.j2` `/mcp` RBAC renders each `direct_remote_ip` principal via a `{% for ip in mcp_allowed_ips %}` loop with the tags at column 0 (each principal + `{{ ip }}` on its own line) — this survives all `trim_blocks`/`lstrip_blocks` combos, unlike the old collapsed-loop form. `verify-secure-mcp.py` renders under all `trim_blocks`/`lstrip_blocks` combos to catch this class.
 - **`docker compose up -d` does not reliably pick up config/env changes.** `start-supabase.sh` must run `down && up` for changes to take effect.
 - **Toggling the log drain requires tearing down with the override file too.** `docker compose -f docker-compose-supabase.yml down` only removes services defined in that file, so disabling the log drain (`required.enable_logging: false`) while analytics/vector are running would orphan them. `start-supabase.sh` always includes `-f docker-compose-logs.yml` in the `down` command whenever the override file exists (it is always rendered), and adds it to `up` only when `log_drain_enabled` is true.
 - **Postgres refuses to init if its log dir is inside the data dir** ("data directory exists but is not empty"). Log to `/var/log/postgresql` (host-mounted into the container), never `/var/lib/postgresql/data/log`.
@@ -274,13 +274,13 @@ Options considered and rejected/benchmarked:
 Revisit decoupling only if deploy-time backup failures start blocking real deployments; for now keep the "MinIO up before Supabase" gate.
 
 ### MCP / Docker networking
-- **`ip-restriction` on `/mcp` with `127.0.0.1`/`::1` can never match** — Docker source-NATs every host-originated connection (localhost, SSH tunnels) to the Docker bridge gateway IP before it reaches Kong, so Kong sees the gateway, not the loopback address. A request from the server itself returns `403 {"message":"IP address not allowed: 172.18.0.1"}`. This was the real cause of the QA 502 that forced commit `b44b6a6` to revert the original MCP feature (`0fe79d3`).
+- **Gateway source-NATs every host-originated connection, so `127.0.0.1`/`::1` can never match** — Docker source-NATs localhost, SSH tunnels, etc. to the Docker bridge gateway IP before it reaches the gateway, so Envoy/Kong sees the gateway, not the loopback address (see commit `b44b6a6`, which reverted the original MCP feature `0fe79d3`). In the Envoy `lds.template.yaml.j2` the `/mcp` allow list uses `direct_remote_ip` principals; in the Kong fallback it is an `ip-restriction` plugin — both must list the pinned gateway.
 - **Pin the compose network subnet so the gateway is deterministic** — `docker-compose-supabase.yml.j2` declares `networks.default.ipam.config.subnet: 172.28.0.0/16`, making the gateway always `172.28.0.1`. `mcp_allowed_ips` must stay in sync with this gateway (default `[172.28.0.1]`). Without the pin, `docker compose down && up` re-issues whatever subnet is free, silently re-breaking the allow list.
-- **The Kong/compose template now ships a top-level `networks:` block** — anything that blind-appends a second `networks:` key (e.g. the m3llm CI/CD `deploy-supabase-stack.yml`, which adds `shared-net`) produces a YAML duplicate-key error and breaks the deploy. Merge into the existing block instead (`grep -q '^networks:'` + `sed -i '/^networks:/a\...'`), never append a second block.
-- **`verify-secure-mcp.py` only renders the template — it never runs Kong.** A syntactically valid but wrong allow list (e.g. `127.0.0.1`) ships green. When touching MCP, cross-check `mcp_allowed_ips` against the pinned subnet gateway.
+- **The compose template now ships a top-level `networks:` block** — anything that blind-appends a second `networks:` key (e.g. the m3llm CI/CD `deploy-supabase-stack.yml`, which adds `shared-net`) produces a YAML duplicate-key error and breaks the deploy. Merge into the existing block instead (`grep -q '^networks:'` + `sed -i '/^networks:/a\...'`), never append a second block.
+- **`verify-secure-mcp.py` only renders the template — it never runs the gateway.** A syntactically valid but wrong allow list (e.g. `127.0.0.1`) ships green. When touching MCP, cross-check `mcp_allowed_ips` against the pinned subnet gateway.
 
 ### Security-by-default
-- **The MCP endpoint must never be publicly reachable**; prefer SSH-tunnel access over opening Kong routes.
+- **The MCP endpoint must never be publicly reachable**; prefer SSH-tunnel access over opening gateway routes.
 - **Docs/README must default to the full secure-featured setup**, never the unprotected minimal one.
 
 ## Config Flow for New Variables

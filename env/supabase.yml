@@ -111,7 +111,7 @@ sb_jwt_jwks:
 
 
 site_url: https://app.example.com # Website url
-api_external_url: https://supa.example.com # For supabase studio # REQUIRED
+api_external_url: https://supa.example.com/auth/v1 # For supabase studio # REQUIRED (must include /auth/v1 — set by setup.sh from required.api_external_url)
 additional_redirect_urls: changeit # https://app.example.com/auth/callback
 mailer_templates_base_url: changeit # https://app.example.com
 
