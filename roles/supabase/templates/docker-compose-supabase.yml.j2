@@ -460,6 +460,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 3
+    env_file:
+      - .env.functions
     environment:
       # Legacy symmetric HS256 key
       JWT_SECRET: ${JWT_SECRET}

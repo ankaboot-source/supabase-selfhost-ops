@@ -37,7 +37,7 @@ make_sandbox() {
 
   # Stub each binary. Each stub appends its argv (one line per arg, NUL-separated
   # for safety) to its .calls file, then behaves per env vars.
-  for bin in pg_dump pg_restore rclone psql; do
+  for bin in pg_dump pg_restore rclone psql supabase docker; do
     cat > "$d/stub-bin/$bin" <<STUB
 #!/bin/bash
 # stub for $bin — logs argv, behaves per env vars
@@ -110,6 +110,36 @@ case "$bin" in
     ;;
   rclone)
     [[ "\${STUB_RCLONE_FAIL:-0}" == "1" ]] && exit 1
+    exit 0
+    ;;
+  supabase)
+    # Supabase CLI stub. Logs argv via the header block above, then:
+    #   functions list   -> prints STUB_SUPABASE_FUNCTIONS (a CLI table:
+    #                       "ID SLUG STATUS ..." — the parser reads SLUG as col 2)
+    #   functions download <slug> -> writes ./supabase/functions/<slug>/index.ts
+    #                                relative to CWD (mimics the real CLI)
+    #   secrets list     -> prints STUB_SUPABASE_SECRETS (a "DIGEST NAME" table)
+    case "\${1:-}" in
+      functions)
+        case "\${2:-}" in
+          list)
+            printf '%s\n' "\${STUB_SUPABASE_FUNCTIONS:-}"
+            ;;
+          download)
+            slug="\${3:-}"
+            mkdir -p "supabase/functions/\$slug"
+            printf 'export default function handler(){ return new Response("ok"); }\n' > "supabase/functions/\$slug/index.ts"
+            ;;
+        esac
+        ;;
+      secrets)
+        case "\${2:-}" in
+          list)
+            printf '%s\n' "\${STUB_SUPABASE_SECRETS:-}"
+            ;;
+        esac
+        ;;
+    esac
     exit 0
     ;;
 esac
@@ -651,6 +681,127 @@ if [[ $RC -eq 0 ]] && echo "$OUT" | grep -q "no vault secrets to migrate"; then
   ok "zero vault secrets handled cleanly"
 else
   fail "zero vault secrets not handled cleanly (rc=$RC)"
+fi
+
+# ─── TC-MIG-026: functions disabled → edge phases skipped ───────────────────
+echo "TC-MIG-026: functions.enabled=false skips edge-function phases cleanly"
+d="$(make_sandbox tc026)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+sed -i 's|^  enabled: true|  enabled: false|' "$d/env/migrate.yml"
+run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] \
+  && echo "$OUT" | grep -qi "Phase 6 skipped (functions.enabled is false)" \
+  && echo "$OUT" | grep -qi "Phase 7 skipped (functions.enabled is false)" \
+  && [[ ! -f "$d/stub-bin/supabase.calls" ]]; then
+  ok "edge phases skipped and Supabase CLI never invoked"
+else
+  fail "functions disabled should skip edge phases without CLI calls (rc=$RC)"
+fi
+
+# ─── TC-MIG-027: Edge functions happy path (download → copy → restart) ───────
+echo "TC-MIG-027: edge functions downloaded, copied into mount, service restarted"
+d="$(make_sandbox tc027)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+mkdir -p "$d/funcs"
+sed -i "s|target_dir: supabase/docker/volumes/functions|target_dir: $d/funcs|" "$d/env/migrate.yml"
+STUB_SUPABASE_FUNCTIONS="$(
+  printf '%s\n' 'c731abc  my-func   DEPLOYED  1  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z'
+  printf '%s\n' '8f2d00e  helper    DEPLOYED  2  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z'
+  printf '%s\n' 'a1b2c3d  my-func   DEPLOYED  1  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z' # dup slug
+)" STUB_SUPABASE_SECRETS="$(
+  printf '%s\n' 'abc12  SEMAPHORE'
+  printf '%s\n' 'def34  REDIS_URL'
+)" \
+  run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] \
+  && [[ -d "$d/funcs/my-func" && -f "$d/funcs/my-func/index.ts" ]] \
+  && [[ -d "$d/funcs/helper" && -f "$d/funcs/helper/index.ts" ]] \
+  && grep -q "ARG download" "$d/stub-bin/supabase.calls" \
+  && grep -qE "ARG restart" "$d/stub-bin/docker.calls" \
+  && grep -qE "ARG functions" "$d/stub-bin/docker.calls" \
+  && ! grep -qE "ARG deploy" "$d/stub-bin/supabase.calls"; then
+  ok "functions downloaded, copied (deduped), container restarted, never deployed"
+else
+  fail "edge happy path broken (rc=$RC)"
+  echo "$OUT" | tail -20
+fi
+# The secret NAMES must be staged as empty entries in .env.functions.
+ENV_FUNCS="$d/funcs/.env.functions"
+if [[ -f "$ENV_FUNCS" ]] \
+  && grep -qE '^SEMAPHORE=$' "$ENV_FUNCS" && grep -qE '^REDIS_URL=$' "$ENV_FUNCS"; then
+  ok "secret names staged as empty NAME= entries in .env.functions"
+else
+  fail ".env.functions missing expected secret name entries"
+fi
+# Phase-7 note must instruct value fill + container recreate.
+echo "$OUT" | grep -qi "force-recreate functions" \
+  && ok "report instructs operator to fill secrets and recreate the container" \
+  || fail "report missing recreate-instruction for secret values"
+
+# ─── TC-MIG-028: no functions on source → clean skip ─────────────────────────
+echo "TC-MIG-028: empty function list produces a clean skip (exit 0)"
+d="$(make_sandbox tc028)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+STUB_SUPABASE_FUNCTIONS="" run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -qi "no edge functions on the source"; then
+  ok "no functions on source handled cleanly"
+else
+  fail "empty function list not handled cleanly (rc=$RC)"
+fi
+
+# ─── TC-MIG-029: missing Supabase CLI → graceful skip, not a failure ─────────
+echo "TC-MIG-029: missing Supabase CLI skips edge phases without failing"
+d="$(make_sandbox tc029)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+# Point tools.supabase at a path that cannot exist so the missing-CLI branch is
+# exercised even on a machine where a real `supabase` binary is installed.
+sed -i 's|^  supabase: supabase$|  supabase: /nonexistent/supabase-cli|' "$d/env/migrate.yml"
+run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] \
+  && echo "$OUT" | grep -qi "Supabase CLI not found — skipping edge-function code migration" \
+  && echo "$OUT" | grep -qi "skipping edge-function secrets"; then
+  ok "edge phases skipped gracefully when the CLI is absent"
+else
+  fail "missing CLI should yield a graceful skip (rc=$RC)"
+fi
+
+# ─── TC-MIG-030: secrets staging never clobbers an existing .env.functions ────
+echo "TC-MIG-030: existing .env.functions entries are never overwritten"
+d="$(make_sandbox tc030)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+mkdir -p "$d/funcs"
+sed -i "s|target_dir: supabase/docker/volumes/functions|target_dir: $d/funcs|" "$d/env/migrate.yml"
+printf 'SEMAPHORE=sk_real_value\n' > "$d/funcs/.env.functions"
+STUB_SUPABASE_SECRETS="$(
+  printf '%s\n' 'abc12  SEMAPHORE'
+  printf '%s\n' 'def34  NEW_SECRET'
+)" run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if grep -q '^SEMAPHORE=sk_real_value$' "$d/funcs/.env.functions" \
+  && grep -qE '^NEW_SECRET=$' "$d/funcs/.env.functions"; then
+  ok "existing value preserved; only new name appended"
+else
+  fail "existing secret value clobbered, or new name not appended"
+  cat "$d/funcs/.env.functions"
+fi
+
+# ─── TC-MIG-031: read-only-source invariant holds for the Supabase CLI ───────
+echo "TC-MIG-031: Supabase CLI is never asked to deploy (deploy targets Cloud)"
+d="$(make_sandbox tc031)"
+cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
+fill_required "$d"
+STUB_SUPABASE_FUNCTIONS="c731abc  my-func   DEPLOYED  1  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z" \
+  run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && [[ -f "$d/stub-bin/supabase.calls" ]] \
+  && ! grep -qE "ARG functions deploy|ARG deploy" "$d/stub-bin/supabase.calls"; then
+  ok "no 'supabase functions deploy' issued against Cloud"
+else
+  fail "read-only-source invariant violated by the CLI (deploy issued)"
+  cat "$d/stub-bin/supabase.calls" 2>/dev/null
 fi
 
 # ─── Summary ───────────────────────────────────────────────────────────────────

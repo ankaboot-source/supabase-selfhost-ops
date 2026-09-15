@@ -27,13 +27,17 @@ of it deeply. Incomplete, but never silently incomplete.
 - Session continuity / resumability
 - Auth config import (manual checklist only)
 - Downtime reduction
-- Edge Function source migration (code is not retrievable from Cloud — see §7)
+- Edge-function SECRET VALUES (write-only in Cloud — only NAMES are retrievable;
+  values are left to the operator, see §6 Phase 7)
 - Per-bucket storage RLS policies (listed as manual steps; they live in
   `pg_catalog.pg_policy`, not `storage.policies`, and the stack seeds its own)
 
-Under the walking-skeleton principle, **storage bucket definitions and vault secrets
-are migrated** (Phase 3 and Phase 5) — both are feasible without breaking the
-read-only-source invariant, so they are no longer non-goals.
+Under the walking-skeleton principle, **storage bucket definitions, vault secrets,
+and edge-function CODE** are migrated (Phase 3, Phase 5, Phase 6) — they are
+feasible without breaking the read-only-source invariant, so they are no longer
+non-goals. Edge-function code is downloadable from Cloud via `supabase functions
+download` (see the Supabase transfer guide); only edge-function secret values
+cannot be retrieved.
 
 ---
 
@@ -49,7 +53,8 @@ read-only-source invariant, so they are no longer non-goals.
 | Storage objects | Copied — no per-bucket RLS policy reconciliation |
 | Storage per-bucket RLS policies | Manual (in `pg_catalog.pg_policy`) |
 | Vault secrets | Migrated, re-encrypted on the target via `vault.create_secret`; skipped (non-fatal) if the source cannot decrypt |
-| Edge Functions | Not migrated — code not retrievable from Cloud; listed as manual steps |
+| Edge Function code | Migrated — downloaded from Cloud (`supabase functions download`, read-only), deployed into `<supabase_path>/volumes/functions/`, container restarted. Skipped if the CLI is missing / list empty / download fails (non-fatal) |
+| Edge Function secrets | NAMES staged as empty `NAME=` entries in `<supabase_path>/.env.functions`; VALUES are operator-supplied (not retrievable from Cloud). Requires a manual fill + container recreate |
 | Cron jobs, webhooks | Carried over best-effort by the schema dump (`cron.job`, `supabase_webhooks.hooks`) — verify |
 | Downtime | A maintenance window, accepted and documented |
 | Restartability | None. A failure means starting over |
@@ -103,6 +108,17 @@ source:
   storage_secret_key: changeit
   storage_region: changeit         # e.g. us-east-1
 
+  # Optional: Supabase CLI access token (Dashboard → Account → Access Tokens),
+  # needed to list/download edge functions and list secret names. Alternatively
+  # export SUPABASE_ACCESS_TOKEN or run `supabase login`.
+  access_token: changeit
+
+# Edge-function migration (defaults to enabled; self-skips when the CLI is
+# missing or the function/secret lists are empty).
+functions:
+  enabled: true
+  target_dir: supabase/docker/volumes/functions   # self-hosted functions mount
+
 target:
   # Self-hosted Postgres DSN (the stack this repo deploys).
   # Default matches the local docker-compose service name + default password.
@@ -120,6 +136,7 @@ tools:
   pg_restore: pg_restore
   rclone: rclone
   psql: psql
+  supabase: supabase
 ```
 
 ### Validation rules
@@ -178,7 +195,26 @@ Phase 5: Vault secrets (re-encrypted on the target)
   ├─ psql -f against target (re-creates + re-encrypts secrets)
   └─ on target failure: warn + add to manual report
 
-Phase 6: Manual-steps report
+Phase 6: Edge function CODE (downloaded read-only from Cloud)
+  ├─ preflight: command -v supabase; if absent → warn + skip + note (never die)
+  ├─ CLI auth: source.access_token → SUPABASE_ACCESS_TOKEN, else existing login
+  ├─ enumerate slugs: supabase functions list --project-ref <ref> (read-only)
+  │     empty list → ok "no functions to migrate", skip
+  ├─ for each: (cd temp && supabase functions download <slug> --project-ref <ref>)
+  │     on failure → warn + note, continue (best-effort network/deploy)
+  ├─ copy each downloaded <slug>/ into <functions_dir> (filesystem-based deploy —
+  │     supabase functions deploy targets Cloud, so it is NOT used)
+  └─ docker compose -f <supabase_path>/docker-compose-supabase.yml restart functions
+
+Phase 7: Edge-function SECRET NAMES (values are write-only in Cloud)
+  ├─ only runs when functions enabled AND CLI present; otherwise skip + note
+  ├─ enumerate names: supabase secrets list --project-ref <ref> (read-only)
+  ├─ append `NAME=` (empty) for each to <supabase_path>/.env.functions, never
+  │     overwriting an existing NAME= entry
+  └─ runtime note: fill values + recreate container
+       (docker compose -f <supabase_path>/docker-compose-supabase.yml up -d --force-recreate functions)
+
+Phase 8: Manual-steps report
   ├─ print a fixed checklist of everything NOT migrated
   └─ exit 0
 ```
@@ -195,6 +231,11 @@ Phase 6: Manual-steps report
     re-creating secrets on the **target** with `vault.create_secret`.
   The source is otherwise touched only by `pg_dump` (read-only). Every write
   (`pg_restore`, `rclone`, `psql -f` with `vault.create_secret`) targets the target DSN.
+- The Supabase CLI is used read-only against the source: `functions list`,
+  `functions download`, and `secrets list` only READ the Cloud project.
+  `supabase functions deploy` targets **Cloud**, not a self-hosted instance, so
+  it is never issued (a test asserts this). The CLI needs auth (`source.access_token`
+  → `SUPABASE_ACCESS_TOKEN`, or an existing `supabase login` session).
 
 ### Non-empty-target refusal
 
@@ -231,11 +272,16 @@ Template (printed verbatim, with runtime substitutions):
    - [ ] Re-configure SMTP settings (already in env/supabase.yml — verify)
    - [ ] Re-create any MFA / SAML / hooks configuration
 
-2. EDGE FUNCTIONS (not migrated automatically — code is not retrievable from Cloud)
-   - [ ] Copy your function source from your project repo (supabase/functions/<name>/index.ts)
-   - [ ] Deploy each onto the self-hosted host: copy the folder into
+2. EDGE FUNCTIONS (code migrated automatically; SECRET VALUES are manual)
+   - [x] Function source downloaded from Cloud and deployed into
+         <supabase_path>/volumes/functions/; the functions service was restarted
+   - [ ] Fill in the edge-function SECRET VALUES in
+         <supabase_path>/.env.functions (each staged as NAME=) and recreate the
+         functions container so the env_file is re-read:
+         docker compose -f <supabase_path>/docker-compose-supabase.yml up -d --force-recreate functions
+   - [ ] If any function failed to download, or the Supabase CLI was missing,
+         deploy the affected function(s) manually: copy the folder into
          <supabase_path>/volumes/functions/ and: docker compose restart functions
-   - [ ] Re-create any function secrets/env vars as a .env.functions override
 
 3. CRON JOBS (migrated best-effort via the schema dump)
    - [x] pg_cron job definitions carried over by the schema+data restore

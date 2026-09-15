@@ -18,6 +18,78 @@
     group: "{{ deploy_user }}"
     recurse: yes
 
+# --- Supabase CLI (optional, best-effort) ------------------------------------
+# The CLI is only needed for the edge-function migration phase of migrate.sh
+# (functions list/download + secrets list). Its absence must never block the
+# stack deploy, so the whole block is best-effort: a failure (download URL
+# changed, GitHub API unreachable, broken package) falls into the rescue branch
+# and only warns instead of failing the run. migrate.sh re-checks for the binary
+# and skips its phases if it is missing.
+- name: Check if Supabase CLI is already installed
+  ansible.builtin.command: which supabase
+  register: sb_cli_present
+  changed_when: false
+  failed_when: false
+
+- name: Ensure Supabase CLI is present (best-effort install, never blocks deploy)
+  when: sb_cli_present.rc != 0
+  block:
+    - name: Resolve latest Supabase CLI release from GitHub
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/supabase/cli/releases/latest"
+        return_content: true
+      register: sb_cli_latest
+      failed_when: false
+      changed_when: false
+
+    - name: Determine CLI package architecture and release tag
+      ansible.builtin.set_fact:
+        sb_cli_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
+        sb_cli_tag: "{{ sb_cli_latest.json.tag_name | default('') }}"
+
+    # Derived in a separate set_fact so sb_cli_tag is already defined when it is
+    # referenced. Ansible evaluates every key of one set_fact against the scope
+    # from BEFORE the task, so putting sb_cli_asset here would fail with
+    # "'sb_cli_tag' is undefined".
+    - name: Derive the CLI .deb asset filename
+      ansible.builtin.set_fact:
+        sb_cli_asset: "supabase_{{ sb_cli_tag | regex_replace('^v', '') }}_linux_{{ sb_cli_arch }}.deb"
+
+    - name: Download latest Supabase CLI .deb package
+      ansible.builtin.get_url:
+        url: "https://github.com/supabase/cli/releases/download/{{ sb_cli_tag }}/{{ sb_cli_asset }}"
+        dest: "/tmp/supabase_cli.deb"
+        mode: "0644"
+      register: sb_cli_download
+      failed_when: false
+      when: sb_cli_tag | length > 0
+
+    - name: Install Supabase CLI .deb package
+      ansible.builtin.apt:
+        deb: /tmp/supabase_cli.deb
+      failed_when: false
+      when: sb_cli_download is defined and sb_cli_download.dest is defined
+
+    - name: Clean up downloaded Supabase CLI package
+      ansible.builtin.file:
+        path: /tmp/supabase_cli.deb
+        state: absent
+      when: sb_cli_download is defined and sb_cli_download.dest is defined
+
+    - name: Verify Supabase CLI install (best-effort — never blocks deploy)
+      ansible.builtin.command: supabase --version
+      register: sb_cli_verify
+      changed_when: false
+      failed_when: false
+
+    - name: Note that the Supabase CLI could not be installed (non-fatal)
+      ansible.builtin.debug:
+        msg: >-
+          Supabase CLI is not installed (best-effort install failed). The
+          self-hosted stack will still deploy; only the edge-function migration
+          phase of migrate.sh is unavailable. Install manually or fix the download URL.
+      when: sb_cli_verify.rc != 0
+
 - name: Ensure /var/log/postgresql directory exists
   ansible.builtin.file:
     path: /var/log/postgresql
@@ -119,7 +191,7 @@
     mode: "{{ item.mode }}"
   with_items:
     - { src: "docker-compose-supabase.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose-supabase.yml", mode: '0664' }
-    - { src: "docker-compose-kong.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose.kong.yml", mode: '0664' }
+    - { src: "docker-compose.kong.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose.kong.yml", mode: '0664' }
     - { src: "docker-compose-logs.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose-logs.yml", mode: '0664' }
     - { src: "vector-logs.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/volumes/logs/vector.yml", mode: '0664' }
     - { src: "kong-supabase.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/{{ kong_conf_path }}/kong.yml", mode: '0664' }
@@ -129,6 +201,16 @@
     - { src: "docker-entrypoint.sh", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/volumes/api/envoy/docker-entrypoint.sh", mode: '0755' }
     - { src: "env-supabase", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/.env", mode: '0664' }
     - { src: "start-supabase.sh", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/start-supabase.sh", mode: '0755' }
+
+# .env.functions is the edge-function secret override consumed by the
+# `functions` service's env_file. Rendered empty by default so compose resolves
+# the env_file reference even when migrate.sh's edge-function secrets phase has
+# never run. migrate.sh appends `NAME=` placeholder lines for the operator to fill.
+- name: Create default empty .env.functions override
+  ansible.builtin.copy:
+    dest: "/home/{{ deploy_user }}/{{ supabase_path }}/.env.functions"
+    content: ""
+    mode: "0664"
 
 - name: Create backup network if needed
   shell: |

@@ -36,6 +36,32 @@ source:
   storage_secret_key: changeit
   storage_region: changeit         # e.g. us-east-1
 
+  # Optional: Supabase CLI access token (needed to list/download edge functions
+  # and list edge-function secret names). Generate one in the Dashboard under
+  # Account → Access Tokens. You may also export SUPABASE_ACCESS_TOKEN instead.
+  # If unset, the Supabase CLI must already be logged in (supabase login).
+  access_token: changeit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTIONS — Edge function migration (opt-in, defaults to enabled)
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge function CODE is downloaded from the Cloud project via the Supabase CLI
+# and deployed into the self-hosted instance's functions mount (filesystem-based
+# deploy — `supabase functions deploy` targets Cloud, not a self-hosted host).
+#
+# Edge function secret VALUES cannot be retrieved from Cloud (they are
+# write-only). Only their NAMES can be listed. The script writes each name as an
+# empty `NAME=` entry into the self-hosted <supabase_path>/.env.functions file,
+# and the manual-steps report tells you to fill in the values and recreate the
+# functions container. With this repo's default supabase_path, the file lives at
+# ~/supabase/docker/.env.functions.
+functions:
+  enabled: true                    # set false to skip edge-function migration
+  # Self-hosted functions mount. Default matches this repo's supabase_path;
+  # override only if you deployed to a custom supabase_path/domain.
+  target_dir: supabase/docker/volumes/functions
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TARGET — Self-hosted Supabase instance
@@ -66,3 +92,4 @@ tools:
   pg_restore: pg_restore
   rclone: rclone
   psql: psql
+  supabase: supabase
