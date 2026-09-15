@@ -191,7 +191,7 @@
     mode: "{{ item.mode }}"
   with_items:
     - { src: "docker-compose-supabase.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose-supabase.yml", mode: '0664' }
-    - { src: "docker-compose-kong.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose.kong.yml", mode: '0664' }
+    - { src: "docker-compose.kong.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose.kong.yml", mode: '0664' }
     - { src: "docker-compose-logs.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/docker-compose-logs.yml", mode: '0664' }
     - { src: "vector-logs.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/volumes/logs/vector.yml", mode: '0664' }
     - { src: "kong-supabase.yml", dest: "/home/{{ deploy_user }}/{{ supabase_path }}/{{ kong_conf_path }}/kong.yml", mode: '0664' }
