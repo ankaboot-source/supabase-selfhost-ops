@@ -39,11 +39,20 @@
         url: "https://api.github.com/repos/supabase/cli/releases/latest"
         return_content: true
       register: sb_cli_latest
+      failed_when: false
+      changed_when: false
 
     - name: Determine CLI package architecture and release tag
       ansible.builtin.set_fact:
         sb_cli_arch: "{{ 'amd64' if ansible_architecture == 'x86_64' else ('arm64' if ansible_architecture == 'aarch64' else ansible_architecture) }}"
         sb_cli_tag: "{{ sb_cli_latest.json.tag_name | default('') }}"
+
+    # Derived in a separate set_fact so sb_cli_tag is already defined when it is
+    # referenced. Ansible evaluates every key of one set_fact against the scope
+    # from BEFORE the task, so putting sb_cli_asset here would fail with
+    # "'sb_cli_tag' is undefined".
+    - name: Derive the CLI .deb asset filename
+      ansible.builtin.set_fact:
         sb_cli_asset: "supabase_{{ sb_cli_tag | regex_replace('^v', '') }}_linux_{{ sb_cli_arch }}.deb"
 
     - name: Download latest Supabase CLI .deb package
@@ -52,10 +61,14 @@
         dest: "/tmp/supabase_cli.deb"
         mode: "0644"
       register: sb_cli_download
+      failed_when: false
+      when: sb_cli_tag | length > 0
 
     - name: Install Supabase CLI .deb package
       ansible.builtin.apt:
         deb: /tmp/supabase_cli.deb
+      failed_when: false
+      when: sb_cli_download is defined and sb_cli_download.dest is defined
 
     - name: Clean up downloaded Supabase CLI package
       ansible.builtin.file:
@@ -68,13 +81,14 @@
       register: sb_cli_verify
       changed_when: false
       failed_when: false
-  rescue:
+
     - name: Note that the Supabase CLI could not be installed (non-fatal)
       ansible.builtin.debug:
         msg: >-
           Supabase CLI is not installed (best-effort install failed). The
           self-hosted stack will still deploy; only the edge-function migration
           phase of migrate.sh is unavailable. Install manually or fix the download URL.
+      when: sb_cli_verify.rc != 0
 
 - name: Ensure /var/log/postgresql directory exists
   ansible.builtin.file:
