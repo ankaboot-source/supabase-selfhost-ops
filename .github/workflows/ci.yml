@@ -241,9 +241,12 @@ jobs:
       - name: Smoke test the API gateway
         run: |
           set -x
-          anon_key=$(sudo grep -oP '^sb_anon_key:\s*\K\S+' env/supabase.yml)
-          curl -fsS -H "apikey: ${anon_key}" http://localhost:8000/rest/v1/ > /dev/null
-          echo "Kong routed a REST request successfully."
+          # Envoy (api-gw) gates the exact /rest/v1/ OpenAPI route to the
+          # service-role key only (lds.template.yaml.j2 rest-v1-openapi-protected),
+          # so authenticate with the service-role key rather than the anon key.
+          service_role_key=$(sudo grep -oP '^sb_service_role_key:\s*\K\S+' env/supabase.yml)
+          curl -fsS -H "apikey: ${service_role_key}" http://localhost:8000/rest/v1/ > /dev/null
+          echo "Envoy routed a REST request successfully."
 
       # Advisory until the no-changed-when backlog in .ansible-lint is worked
       # off: 18 tasks shell out and report "changed" unconditionally, so a
