@@ -99,9 +99,9 @@ secrets:
 # Set to `true` to enable. Disabled components are skipped entirely.
 # When you enable a component, fill in its block under ADVANCED below.
 components:
-  caddy: false      # Reverse proxy + automatic TLS + SSO (recommended for production)
-  monitor: false    # Grafana + Prometheus + Loki monitoring stack
-  fail2ban: false   # Brute-force protection for PostgreSQL
+  caddy: true      # Reverse proxy + automatic TLS + SSO (recommended for production)
+  monitor: true    # Grafana + Prometheus + Loki monitoring stack
+  fail2ban: true   # Brute-force protection for PostgreSQL
   backup: false     # Automated backups + PITR with pgBackRest (recommended)
   ufw: false        # UFW firewall — allow/deny rules per port
   luks: false       # At-rest disk encryption (LUKS)
