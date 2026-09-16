@@ -302,11 +302,14 @@ See the **Ansible / Jinja2** and **setup.sh / config flow** pitfall subsections 
 Migrates a Supabase Cloud project into a self-hosted instance. Lives at `migrate.sh` with config at `env/migrate.yml` (copy of `env/migrate.example.yml`).
 
 ### Architecture
-Four phases run sequentially:
-1. **DB dump+restore** — probes all schemas from source, dumps them in a single `pg_dump`, restores in a single `pg_restore`
+The phases run sequentially (non-resumable; a failure means starting over):
+1. **DB dump+restore** — probes all schemas from source, dumps them in a single `pg_dump`, restores in a single `pg_restore`. Also captures user-schema FKs that reference Supabase-managed schemas and re-creates them **after** all data phases.
 2. **Auth users** — data-only dump of `auth.users` + `auth.identities` (preserves UUIDs)
-3. **Storage objects** — `rclone copy` from source S3 to target S3 (best-effort)
-4. **Manual steps report** — prints checklist for post-migration tasks
+3. **Storage buckets** — data-only restore of `storage.buckets` (must precede the object copy)
+4. **Storage objects** — **source S3 read via `rclone`, written to the target via its Storage REST API** (`POST /storage/v1/object/<bucket>/<path>` with the service-role JWT). The self-hosted S3 protocol is unreliable, so it is NOT used for the copy.
+5. **Vault secrets** — re-encrypted on the target via `vault.create_secret`
+6. **Edge functions** — code downloaded read-only from Cloud, deployed into `volumes/functions/`; secret NAMES staged in `.env.functions`
+7. **Manual steps report** — prints checklist for post-migration tasks
 
 ### Key Difficulty: Cross-Schema Dependencies (Triggers)
 **Problem:** The original per-schema loop (`for schema in ...; do pg_dump --schema=$s; pg_restore; done`) dumped/restored schemas one at a time. Triggers on `public` tables referencing `auth.*` functions failed because `auth` wasn't restored yet when `public` ran. The `--exit-on-error` flag caused those trigger failures to abort the schema restore, so triggers were silently lost.
@@ -325,3 +328,14 @@ Four phases run sequentially:
 
 ### Key Requirement: supabase_admin User
 The target `db_url` must use `supabase_admin` (superuser), not `postgres`. Only `supabase_admin` has the privileges to restore DDL in the `auth` and `storage` schemas. The `migrate.example.yml` now documents this requirement and provides the correct connection string format.
+
+### Migration field-testing pitfalls (verified on a live instance)
+- **`vault.create_secret(secret, name, description)` takes the SECRET first, then NAME.** Passing `(name, secret, desc)` silently stores the value in the `name` column and the name in `secret` — the vault then looks "migrated" but every secret name/value is swapped. Check the signature (`pg_proc` arg names `new_secret, new_name, new_description`), don't guess. Validate by reading back `vault.decrypted_secrets` (name must be the key name, decrypted_secret the value).
+- **`vault.secrets.description` is NOT NULL on the target.** Passing `NULLIF('%s','')` (→ NULL for empty descriptions) makes `vault.create_secret` fail. The read already COALESCEs to `''`; pass `''::text` (never NULL).
+- **Self-hosted storage-api's S3 protocol can reject EVERY valid SigV4 signature** (stub/standalone tenant: `TENANT_ID=stub`, `REGION=stub`, no `storage.tenants` table; returns 403 `SignatureDoesNotMatch` for correct creds, any region, via rclone AND curl `--aws-sigv4`). Do NOT build the object copy on it. Migrate objects via the **Storage REST API** with the service-role JWT — the REST API (JWT-auth) is independent of the S3 protocol and works: `GET /storage/v1/bucket`, `POST /storage/v1/object/<bucket>/<path>` (stream `rclone cat src:key | curl --data-binary @-`), `DELETE` to clean up test objects.
+- **rclone `--progress=no` is invalid** (`strconv.ParseBool` fails) and older rclone (e.g. v1.60) **also rejects `--no-progress`** (`unknown flag`). Just omit the flag — progress is already off when stdout is not a TTY.
+- **rclone `s3 provider "Supabase"` is not recognized by older rclone** (v1.60) and breaks the copy. Supabase storage is standard S3 — use plain `type = s3` + endpoint + region (works across versions).
+- **Supabase CLI 2.x table output parsing.** `supabase functions list` / `secrets list` print an ASCII table with ANSI cursor codes (`\x1b[?25l`/`[?25h`) and MIXED delimiters (`│` box-drawing AND `|` pipe). Splitting on whitespace yields garbage names (`│`, `-----|-----`), which then produces junk `grep: Unmatched [...]` and phantom downloads. Strip ANSI, split on `|`, take SLUG=field 2 (`functions list`: `ID | NAME | SLUG | …`) and NAME=field 0 (`secrets list`: `NAME | DIGEST`), skip header/separator rows, and only keep `[A-Za-z0-9_-]+` tokens in the fallback single-column branch.
+- **Cross-schema FKs referencing auth.* are silently dropped by Phase 1 restore.** `auth.users` data arrives in Phase 2, so `ALTER TABLE public.profiles ADD CONSTRAINT … REFERENCES auth.users(id)` fails during Phase 1 (empty table) and the constraint is lost. The fix captures those FK defs from the source before restore and re-`ADD`s them after all data phases. The probe must NOT use `confnamespace` (that's the FK's own schema); get the REFERENCED table's schema via a `pg_namespace`/`pg_class` join on `confrelid` or the query errors with `column "confnamespace" does not exist`.
+- **`supabase functions download` extracts with ROOT ownership**, so a deploy_user can't `rm -rf` the temp dir and the `set -e` script aborts right after Phase 6. Guard the temp cleanup (`rm -rf … || true`).
+- **`.env.functions` created root-owned by the supabase role** (the `copy` task runs as root), so the phase-7 append as `deploy_user` gets `Permission denied` and kills the run. Fix ownership at the source (role task owner `deploy_user`) AND make the append non-fatal (report note) when not writable.

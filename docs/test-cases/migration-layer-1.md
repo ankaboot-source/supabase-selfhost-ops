@@ -74,7 +74,8 @@ command is ever issued against the source DSN).
 - **Given**: valid config + stubbed binaries (psql returns 0 for both counts)
 - **When**: `bash migrate.sh --config env/migrate.yml --yes`
 - **Then**: exits 0, invokes `pg_dump` against source DSN, invokes `pg_restore`
-  against target DSN, invokes `rclone copy` (not sync/move), and prints the
+  against target DSN, lists source storage via `rclone lsf -R` and uploads each
+  object to the target Storage REST API (never mutating the source), and prints the
   manual-steps report
 
 ### TC-MIG-012: Manual-steps report is always printed
@@ -133,7 +134,7 @@ command is ever issued against the source DSN).
 - **Given**: full happy path with stubs that log a shared invocation timeline
 - **When**: the script runs
 - **Then**: the `pg_dump` carrying `--table=storage.buckets` appears in the shared
-  timeline **before** the `rclone copy` invocation (Phase 3 precedes Phase 4)
+  timeline **before** the storage object listing/upload (Phase 3 precedes Phase 4)
 
 ### TC-MIG-022: Storage bucket restore is data-only + read-only on source
 - **Given**: full happy path with stubs

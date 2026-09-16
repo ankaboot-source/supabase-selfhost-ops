@@ -50,7 +50,7 @@ cannot be retrieved.
 | Auth users | Migrated with UUIDs preserved — users must log in again |
 | Auth configuration | Manual, printed as a checklist |
 | Storage bucket definitions | Migrated (data-only `storage.buckets` restore, before object copy) |
-| Storage objects | Copied — no per-bucket RLS policy reconciliation |
+| Storage objects | Migrated — source S3 read via rclone, written to the target via the **Storage REST API** (service-role JWT); no per-bucket RLS policy reconciliation |
 | Storage per-bucket RLS policies | Manual (in `pg_catalog.pg_policy`) |
 | Vault secrets | Migrated, re-encrypted on the target via `vault.create_secret`; skipped (non-fatal) if the source cannot decrypt |
 | Edge Function code | Migrated — downloaded from Cloud (`supabase functions download`, read-only), deployed into `<supabase_path>/volumes/functions/`, container restarted. Skipped if the CLI is missing / list empty / download fails (non-fatal) |
@@ -124,11 +124,12 @@ target:
   # Default matches the local docker-compose service name + default password.
   db_url: postgresql://postgres:postgres@localhost:5432/postgres
 
-  # Self-hosted storage endpoint (Kong /storage/v1).
-  storage_endpoint: http://localhost:8000/storage/v1
-  storage_access_key: changeit     # from env/supabase.yml s3_protocol_access_key_id
-  storage_secret_key: changeit     # from env/supabase.yml s3_protocol_access_key_secret
-  storage_region: us-east-1
+  # Self-hosted storage REST API base (JWT-authed, what the app uses). Objects
+  # are written here with the service-role key. The S3-protocol endpoint was
+  # abandoned for the copy because self-hosted storage-api S3 auth is unreliable.
+  rest_base_url: http://localhost:8000/storage/v1
+  # Target SERVICE_ROLE_KEY — grab it from $HOME/supabase/docker/.env.
+  service_role_key: changeit
 
 # Tools — paths to required binaries. Defaults resolve via PATH.
 tools:
@@ -146,7 +147,9 @@ tools:
   `postgres://`).
 - `target.db_url` must start with `postgresql://` and must **not equal**
   `source.db_url` (read-only-source invariant).
-- `source.storage_*` and `target.storage_*` must not be `changeit`.
+- `source.storage_*` must not be `changeit`.
+- `target.service_role_key` gates the storage object copy; if it is `changeit`/empty
+  the storage phase is skipped (non-fatal) with a manual-report note.
 - Required binaries (`pg_dump`, `pg_restore`, `rclone`, `psql`) must be on PATH.
 
 ---
@@ -166,6 +169,10 @@ Phase 1: Database — schema + data
   ├─ pg_dump source (per-schema, custom format)
   │     flags: --format=custom --no-owner --no-privileges --schema=<name>
   │     + discovered user schemas only (Supabase-managed schemas excluded)
+  ├─ BEFORE restore: capture user-schema FK constraints that reference a
+  │     Supabase-managed schema (auth/storage/…). Their referenced ROWS arrive in
+  │     later phases, so the FK ADD during restore fails and the constraint is
+  │     silently dropped. Defer re-creating them until all data phases finish.
   ├─ pg_restore into target (DSN via --dbname=, archive file as positional)
   └─ on failure: warn() + add to runtime notes (non-fatal)
 
@@ -179,11 +186,16 @@ Phase 3: Storage bucket definitions (MUST precede the object copy)
   ├─ pg_restore into target
   └─ if absent, object copy hits NoSuchBucket on a fresh instance
 
-Phase 4: Storage objects (rclone copy)
-  ├─ configure rclone remote for source S3 endpoint (read-only)
-  ├─ configure rclone remote for target S3 endpoint
-  ├─ rclone copy source:bucket target:bucket --progress=no
-  └─ on failure: warn (storage is best-effort) + add to manual report
+Phase 4: Storage objects (source S3 → target Storage REST API)
+  ├─ configure an rclone remote for the SOURCE S3 endpoint only (read-only)
+  ├─ rclone lsf -R --files-only to enumerate keys (`<bucket>/<relpath>`)
+  ├─ for each key: rclone cat (source) | curl -X POST
+  │     $rest_base_url/object/<bucket>/<relpath>
+  │     with "Authorization: Bearer <service_role_key>" + Content-Type
+  │   (streams the download straight into the upload — no temp files;
+  │    paths are URL-encoded; writes go ONLY to the target)
+  ├─ on any failure: warn + report note (best-effort, never aborts)
+  └─ skipped (non-fatal) if target.service_role_key is changeit/empty
 
 Phase 5: Vault secrets (re-encrypted on the target)
   ├─ preflight: SELECT count(*) FROM vault.decrypted_secrets on source (read-only)
@@ -214,6 +226,11 @@ Phase 7: Edge-function SECRET NAMES (values are write-only in Cloud)
   └─ runtime note: fill values + recreate container
        (docker compose -f <supabase_path>/docker-compose-supabase.yml up -d --force-recreate functions)
 
+Phase 7.5: Deferred FK constraints (re-create after all data phases)
+  ├─ re-run the FK definitions captured in Phase 1 on the target
+  │     (ALTER TABLE ... ADD CONSTRAINT) once auth/storage/vault data is present
+  └─ on failure: warn + report note (constraint left for manual re-creation)
+
 Phase 8: Manual-steps report
   ├─ print a fixed checklist of everything NOT migrated
   └─ exit 0
@@ -222,7 +239,8 @@ Phase 8: Manual-steps report
 ### Read-only-source enforcement
 
 - `pg_dump` is inherently read-only (no `--write` flag exists).
-- `rclone copy` (not `sync`, not `move`) — source is never mutated.
+- `rclone` touches the source only with read-only `lsf -R` (LIST) and `cat` (GET);
+  object writes go to the target via the Storage REST API upload — source is never mutated.
 - A preflight assertion `source.db_url != target.db_url` prevents the catastrophic
   case of pointing both ends at the same database.
 - All `psql` calls against the source are **read-only `SELECT`s only**:
@@ -230,7 +248,8 @@ Phase 8: Manual-steps report
   - the vault phase reads `vault.decrypted_secrets` via `SELECT` (source) before
     re-creating secrets on the **target** with `vault.create_secret`.
   The source is otherwise touched only by `pg_dump` (read-only). Every write
-  (`pg_restore`, `rclone`, `psql -f` with `vault.create_secret`) targets the target DSN.
+  (`pg_restore`, `psql -f` with `vault.create_secret`, the storage REST upload)
+  targets the target DSN.
 - The Supabase CLI is used read-only against the source: `functions list`,
   `functions download`, and `secrets list` only READ the Cloud project.
   `supabase functions deploy` targets **Cloud**, not a self-hosted instance, so

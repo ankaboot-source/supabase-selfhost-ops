@@ -211,6 +211,8 @@
     dest: "/home/{{ deploy_user }}/{{ supabase_path }}/.env.functions"
     content: ""
     mode: "0664"
+    owner: "{{ deploy_user }}"
+    group: "{{ deploy_user }}"
 
 - name: Create backup network if needed
   shell: |
