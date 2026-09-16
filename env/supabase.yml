@@ -199,20 +199,20 @@ projects:
   supabase:
     log_file: supabase-access
     domain: "sb.example.com"
-    allowed_ips:
-      - 123.123.123.123
-      - 111.111.111.111
+#    allowed_ips:
+#      - 123.123.123.123
+#      - 111.111.111.111
     oidc_enabled: true
     upstreams:
       # Dashboard with optional auth
       - targets: ["localhost:3001"]
         paths: [""]
         oidc: true
-        basicauth:
-          - path: /project/default
-            username: you_user
+#        basicauth:
+#          - path: /project/default
+#            username: you_user
             # Generate with caddy hash-password
-            password: $2at3jQ0mIR7Mg0kLwP/BgCKRzz3MRnq0wapfFjypEhosvu
+#            password: $2at3jQ0mIR7Mg0kLwP/BgCKRzz3MRnq0wapfFjypEhosvu
       # API routes
       - targets: ["localhost:8000"]
         paths:
