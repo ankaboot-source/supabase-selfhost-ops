@@ -83,6 +83,14 @@ target:
   storage_secret_key: changeit
   storage_region: local
 
+  # Storage REST API base (the JWT-authed API the app uses). Objects are written
+  # here with the service-role key below. The S3 protocol endpoint above is NOT
+  # used for the object copy (self-hosted storage-api S3 auth is unreliable);
+  # keep these values for reference/compatibility.
+  rest_base_url: http://localhost:8000/storage/v1
+  # Target SERVICE_ROLE_KEY — grab it from $HOME/supabase/docker/.env.
+  service_role_key: changeit
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOLS — Required binaries (defaults resolve via PATH)

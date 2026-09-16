@@ -71,7 +71,7 @@ The script:
   - Dumps and restores the database (schema + data, Supabase-managed schemas)
   - Migrates auth.users and auth.identities with UUIDs preserved
   - Restores storage bucket definitions (required for the object copy)
-  - Copies storage objects via rclone (read-only against source)
+  - Copies storage objects (source S3 read via rclone → target Storage REST API)
   - Migrates vault secrets, re-encrypted on the target
   - Downloads edge-function code from Cloud (read-only) and deploys it into the
     self-hosted functions mount; stages edge-function secret NAMES in
@@ -242,9 +242,11 @@ BUCKET_DUMP=""
 VAULT_ROWS=""
 VAULT_SQL=""
 RCLONE_CONF=""
+FK_ROWS=""
+DEFERRED_FK_SQL=""
 cleanup() {
-  rm -f "$DUMP_FILE" "$AUTH_DUMP" "$BUCKET_DUMP" "$VAULT_ROWS" "$VAULT_SQL" "$RCLONE_CONF"
-  rm -rf "$LOG_DIR"
+  rm -f "$DUMP_FILE" "$AUTH_DUMP" "$BUCKET_DUMP" "$VAULT_ROWS" "$VAULT_SQL" "$RCLONE_CONF" "$FK_ROWS" "$DEFERRED_FK_SQL"
+  # rm -rf "$LOG_DIR"   # DEBUG: keep logs under /tmp/migrate-logs-* for troubleshooting
 }
 trap cleanup EXIT
 
@@ -258,7 +260,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   log "    schemas: auto-discovered (excluding Supabase system schemas: auth, storage, realtime, etc.)"
   log "  Phase 2: pg_dump auth.users + auth.identities → pg_restore target (UUIDs preserved)"
   log "  Phase 3: pg_dump storage.buckets → pg_restore target (bucket definitions)"
-  log "  Phase 4: rclone copy source-storage → target-storage (read-only against source)"
+  log "  Phase 4: storage objects — source S3 (rclone) → target Storage REST API (service-role key)"
   log "  Phase 5: vault secrets → re-encrypted on the target via vault.create_secret"
   log "  Phase 6: edge functions → downloaded from Cloud (read-only), deployed into ${FUNCTIONS_ABS}"
   log "  Phase 7: edge-function secrets → secret NAMES written to ${SUPABASE_COMPOSE_DIR}/.env.functions (values operator-supplied)"
@@ -330,6 +332,55 @@ done <<< "$source_schemas"
 
 [[ ${#SCHEMA_FLAGS[@]} -eq 0 ]] && die "no schemas found on source — nothing to migrate."
 log "  schemas to migrate (user schemas only): ${SCHEMA_FLAGS[*]}"
+
+# Deferred FK constraints: user-schema FKs that reference a Supabase-managed
+# (excluded) schema such as auth, storage, vault, etc. The referenced ROWS
+# arrive in later phases (auth.users in Phase 2, storage.buckets in Phase 3,
+# vault in Phase 5), so the FK creation during Phase 1's restore fails and the
+# constraint is silently dropped. Capture their definitions here (read-only
+# against the source) and re-create them after all data phases complete.
+FK_ROWS="$(mktemp -t migrate-fk-rows-XXXXXX.tsv)"
+DEFERRED_FK_SQL="$(mktemp -t migrate-fk-XXXXXX.sql)"
+if ! "$PSQL" "$SRC_DB_URL" -tAX -F $'\t' -c "SELECT
+      (conrelid::regclass)::text,
+      conname,
+      pg_get_constraintdef(oid)
+    FROM pg_constraint
+    WHERE contype = 'f'
+      AND connamespace::regclass::text NOT IN
+          ('auth','storage','realtime','extensions','graphql','graphql_public',
+           'pgbouncer','vault','pgsodium','pg_catalog','information_schema','pg_toast')
+      AND (SELECT n.nspname
+             FROM pg_namespace n
+             JOIN pg_class c ON c.relnamespace = n.oid
+            WHERE c.oid = confrelid)::text IN
+          ('auth','storage','realtime','extensions','graphql','graphql_public',
+           'pgbouncer','vault','pgsodium')
+    ORDER BY 1,2;" 2>"$LOG_DIR/fk-probe.err" > "$FK_ROWS"; then
+  warn "could not probe deferred FK constraints — they may be missing after restore."
+  warn "  See $LOG_DIR/fk-probe.err"
+  add_note "Could not probe deferred FK constraints. Some FKs referencing auth/storage may be missing."
+fi
+if [[ -s "$FK_ROWS" ]]; then
+  python3 - "$FK_ROWS" "$DEFERRED_FK_SQL" <<'PY' || warn "could not build deferred-FK SQL script"
+import sys
+rows_path, sql_path = sys.argv[1], sys.argv[2]
+def esc(s):
+    return s.replace("'", "''")
+stmts = []
+with open(rows_path) as f:
+    for line in f:
+        parts = line.rstrip("\n").split("\t", 2)
+        if len(parts) < 3 or not parts[1]:
+            continue
+        tbl, name, cdef = parts[0], parts[1], parts[2]
+        stmts.append("ALTER TABLE ONLY %s ADD CONSTRAINT %s %s;" % (tbl, esc(name), cdef))
+if stmts:
+    with open(sql_path, "w") as f:
+        f.write("\n".join(stmts) + "\n")
+PY
+fi
+[[ -s "$DEFERRED_FK_SQL" ]] && log "  deferred FK constraints to re-create after data phases: $(awk 'END{print NR}' "$DEFERRED_FK_SQL")"
 
 DUMP_FILE="$(mktemp -t migrate-dump-XXXXXX.dump)"
 log "  dumping database…"
@@ -408,46 +459,97 @@ else
 fi
 rm -f "$BUCKET_DUMP"
 
-# ─── Phase 4: Storage objects (rclone copy — read-only against source) ───────
-log "Phase 4: copying storage objects via rclone (read-only against source)…"
+# ─── Phase 4: Storage objects ─────────────────────────────────────────────────
+# Source is read via the Cloud S3 API (rclone). Target objects are written via
+# the target's Storage REST API (JWT-authed with the service-role key), NOT via
+# S3 — the self-hosted storage-api S3 protocol is unreliable/disabled, but the
+# REST API the app uses works.
+log "Phase 4: copying storage objects via target Storage REST API (read-only against source)…"
 
 SRC_STORAGE_ENDPOINT="$(cfg_get "source.storage_endpoint")"
 SRC_STORAGE_AK="$(cfg_get "source.storage_access_key")"
 SRC_STORAGE_SK="$(cfg_get "source.storage_secret_key")"
 SRC_STORAGE_REGION="$(cfg_get "source.storage_region")"
-TGT_STORAGE_ENDPOINT="$(cfg_get "target.storage_endpoint")"
-TGT_STORAGE_AK="$(cfg_get "target.storage_access_key")"
-TGT_STORAGE_SK="$(cfg_get "target.storage_secret_key")"
-TGT_STORAGE_REGION="$(cfg_get "target.storage_region")"
+TGT_REST_BASE="$(cfg_get "target.rest_base_url")"
+TGT_REST_BASE="${TGT_REST_BASE:-http://localhost:8000/storage/v1}"
+TGT_SERVICE_KEY="$(cfg_get "target.service_role_key")"
 
-# Build ephemeral rclone config. rclone reads config from a file via --config.
-RCLONE_CONF="$(mktemp -t migrate-rclone-XXXXXX.conf)"
-cat > "$RCLONE_CONF" <<EOF
+if [[ -z "$TGT_SERVICE_KEY" || "$TGT_SERVICE_KEY" == "changeit" ]]; then
+  warn "target.service_role_key is not set — skipping storage object copy."
+  warn "  Set it to the target's SERVICE_ROLE_KEY (from <supabase_path>/.env)."
+  add_note "Storage objects skipped: target.service_role_key is not configured."
+else
+  # Build an ephemeral rclone config for the SOURCE ONLY (Cloud S3). No
+  # `provider = Supabase` (unrecognized on older rclone); standard S3 works.
+  RCLONE_CONF="$(mktemp -t migrate-rclone-XXXXXX.conf)"
+  cat > "$RCLONE_CONF" <<EOF
 [src]
 type = s3
-provider = Supabase
 endpoint = ${SRC_STORAGE_ENDPOINT}
 access_key_id = ${SRC_STORAGE_AK}
 secret_access_key = ${SRC_STORAGE_SK}
 region = ${SRC_STORAGE_REGION}
-
-[tgt]
-type = s3
-provider = Supabase
-endpoint = ${TGT_STORAGE_ENDPOINT}
-access_key_id = ${TGT_STORAGE_AK}
-secret_access_key = ${TGT_STORAGE_SK}
-region = ${TGT_STORAGE_REGION}
 EOF
 
-# rclone copy (NOT sync, NOT move) — source is never mutated.
-# --progress=no keeps output TTY-free (runs with no TTY attached).
-if "$RCLONE" --config "$RCLONE_CONF" copy src: tgt: \
-     --progress=no 2>"$LOG_DIR/rclone.err"; then
-  ok "Phase 4 complete (storage objects copied)."
-else
-  warn "storage copy failed — see $LOG_DIR/rclone.err (best-effort at this layer)"
-  add_note "Storage copy failed. See $LOG_DIR/rclone.err. Re-run rclone manually after fixing the config."
+  # Guess a Content-Type from the object key extension.
+  guess_mime() {
+    case "${1,,}" in
+      *.png) echo image/png ;; *.jpg|*.jpeg) echo image/jpeg ;; *.gif) echo image/gif ;;
+      *.webp) echo image/webp ;; *.svg) echo image/svg+xml ;; *.bmp) echo image/bmp ;;
+      *.avif) echo image/avif ;; *.txt|*.md) echo text/plain ;;
+      *.html|*.htm) echo text/html ;; *.css) echo text/css ;; *.js) echo text/javascript ;;
+      *.json) echo application/json ;; *.xml) echo application/xml ;;
+      *.pdf) echo application/pdf ;; *.zip) echo application/zip ;;
+      *.mp4) echo video/mp4 ;; *.webm) echo video/webm ;; *.mp3) echo audio/mpeg ;;
+      *.woff|*.woff2) echo font/woff2 ;; *.ttf) echo font/ttf ;;
+      *) echo application/octet-stream ;;
+    esac
+  }
+
+  # URL-encode a path (keeps '/' so multi-segment object paths survive).
+  urlenc() { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"; }
+
+  # Enumerate all source object keys. rclone lsf -R yields one `<bucket>/<relpath>`
+  # per line (read-only against the source; nothing is written there).
+  log "  listing source objects…"
+  SRC_KEYS=()
+  while IFS= read -r k; do
+    [[ -n "$k" ]] && SRC_KEYS+=("$k")
+  done < <("$RCLONE" --config "$RCLONE_CONF" lsf -R --files-only src: 2>"$LOG_DIR/rclone.err")
+
+  if [[ ${#SRC_KEYS[@]} -eq 0 ]]; then
+    ok "Phase 4 complete — no storage objects on the source to migrate."
+  else
+    log "  migrating ${#SRC_KEYS[@]} storage object(s) via target Storage REST API…"
+    uploaded=0; failed=0
+    for key in "${SRC_KEYS[@]}"; do
+      [[ -z "$key" ]] && continue
+      bucket="${key%%/*}"; relpath="${key#*/}"
+      obj_url="$TGT_REST_BASE/object/$(urlenc "$bucket")/$(urlenc "$relpath")"
+      ctype="$(guess_mime "$relpath")"
+      code=""
+      # Stream: rclone cat (source, read-only) piped straight into the target upload.
+      code="$("$RCLONE" --config "$RCLONE_CONF" cat "src:$key" 2>>"$LOG_DIR/rclone.err" | \
+        curl -s -o /dev/null -w "%{http_code}" -X POST \
+          -H "Authorization: Bearer $TGT_SERVICE_KEY" \
+          -H "Content-Type: $ctype" \
+          --data-binary @- "$obj_url" 2>>"$LOG_DIR/rclone.err")"
+      if [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]]; then
+        uploaded=$((uploaded + 1))
+      else
+        failed=$((failed + 1))
+        warn "  upload failed ($code): $key"
+        printf -- "  upload failed (%s): %s\n" "$code" "$key" >> "$LOG_DIR/rclone.err"
+      fi
+    done
+    if [[ $failed -eq 0 ]]; then
+      ok "Phase 4 complete (${uploaded} storage object(s) migrated)."
+    else
+      warn "Phase 4 partial: ${uploaded} uploaded, ${failed} failed — see $LOG_DIR/rclone.err"
+      add_note "Storage objects: ${uploaded} migrated, ${failed} failed. See $LOG_DIR/rclone.err."
+    fi
+  fi
+  rm -f "$RCLONE_CONF"
 fi
 
 # ─── Phase 5: Vault secrets (re-encrypted on the target) ─────────────────────
@@ -508,8 +610,13 @@ with open(rows_path) as f:
         if name in seen or not name:
             continue
         seen.add(name)
-        stmt = "SELECT vault.create_secret('%s'::text, '%s'::text, NULLIF('%s','')::text);" \
-               % (esc(name), esc(secret), esc(desc))
+        # vault.create_secret signature is (new_secret, new_name, new_description,
+        # new_key_id) — the SECRET comes FIRST, then the NAME. Passing them swapped
+        # would store the value in `name` and the name in `secret`.
+        # description is already COALESCEd to '' at read time; pass '' (never
+        # NULL) because vault.secrets.description is NOT NULL on the target.
+        stmt = "SELECT vault.create_secret('%s'::text, '%s'::text, '%s'::text);" \
+               % (esc(secret), esc(name), esc(desc))
         statements.append(stmt)
 if statements:
     with open(sql_path, "w") as f:
@@ -553,20 +660,30 @@ else
     export SUPABASE_ACCESS_TOKEN="$SB_AT"
   fi
 
-  # Enumerate function slugs. Parses either a CLI table (SLUG is the 2nd token
-  # on non-header rows) or a bare one-slug-per-line list.
+  # Enumerate function slugs. The CLI prints an ASCII table
+  # (ID | NAME | SLUG | STATUS | ...) with ANSI cursor codes and box/pipe chars,
+  # so we strip ANSI, split on the pipe delimiter, and take the SLUG column
+  # (field 2). Header and separator rows are skipped. A bare one-slug-per-line
+  # list is also handled (single field).
   FUNC_SRC="$(mktemp -d -t migrate-functions-XXXXXX)"
   readarray -t FUNC_SLUGS < <("$SUPABASE" functions list --project-ref "$SRC_PROJECT_REF" \
       2>"$LOG_DIR/fn-list.err" | python3 -c '
-import sys
+import re, sys
 for line in sys.stdin:
-    t = line.split()
-    if not t:
-        continue
-    if len(t) >= 2 and t[0] != "ID":
-        print(t[1])
-    elif len(t) == 1:
-        print(t[0])
+    line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
+    if "|" in line:
+        f = [c.strip() for c in line.split("|")]
+        f = [c for c in f if c]
+        if len(f) < 3: continue
+        if f[0].strip(" -").upper() == "ID" or f[0].strip(" -") == "": continue
+        if not re.match(r"^[A-Za-z0-9_-]+$", f[2]): continue
+        print(f[2])
+    else:
+        t = line.split()
+        # Slug-only lines: keep single alphanumeric/underscore/hyphen tokens,
+        # skipping ANSI/box-drawing noise (e.g. a lone "│").
+        if len(t) == 1 and t[0] != "ID" and re.match(r"^[A-Za-z0-9_-]+$", t[0]):
+            print(t[0])
 ')
   if [[ ${#FUNC_SLUGS[@]} -eq 0 ]]; then
     ok "Phase 6 complete — no edge functions on the source to migrate."
@@ -616,7 +733,10 @@ for line in sys.stdin:
       fi
     fi
   fi
-  rm -rf "$FUNC_SRC"
+  # Downloads are extracted with root ownership by the CLI, so supa cannot always
+  # remove them; guard so this never aborts the migration (leaves a /tmp dir to
+  # be cleaned by an operator/root).
+  rm -rf "$FUNC_SRC" 2>/dev/null || true
 fi
 
 # ─── Phase 7: Edge-function secrets (names only — values are not retrievable) ─
@@ -641,42 +761,70 @@ else
 
   readarray -t SECRET_NAMES < <("$SUPABASE" secrets list --project-ref "$SRC_PROJECT_REF" \
       2>"$LOG_DIR/sec-list.err" | python3 -c '
-import sys
+import re, sys
 for line in sys.stdin:
-    t = line.split()
-    if not t:
-        continue
-    if len(t) >= 2 and t[0] != "DIGEST":
-        print(t[1])
-    elif len(t) == 1:
-        print(t[0])
+    line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line)
+    if "|" in line:
+        f = [c.strip() for c in line.split("|")]
+        f = [c for c in f if c]
+        if len(f) < 1: continue
+        if f[0].strip(" -").upper() == "NAME" or f[0].strip(" -") == "": continue
+        print(f[0])
+    else:
+        t = line.split()
+        if len(t) == 1 and t[0] != "NAME":
+            print(t[0])
 ')
   ENV_FUNCS="$SUPABASE_COMPOSE_DIR/.env.functions"
   if [[ ${#SECRET_NAMES[@]} -eq 0 ]]; then
     ok "Phase 7 complete — no edge-function secrets to stage."
   else
     if [[ ! -f "$ENV_FUNCS" ]]; then
-      mkdir -p "$SUPABASE_COMPOSE_DIR"
-      touch "$ENV_FUNCS"
+      mkdir -p "$SUPABASE_COMPOSE_DIR" 2>/dev/null || true
+      touch "$ENV_FUNCS" 2>/dev/null || true
     fi
-    appended=0
-    for name in "${SECRET_NAMES[@]}"; do
-      [[ -z "$name" ]] && continue
-      # Never clobber an existing entry (an earlier run may have set a value).
-      if grep -qE "^${name}=" "$ENV_FUNCS"; then
-        continue
-      fi
-      printf '%s=\n' "$name" >> "$ENV_FUNCS"
-      appended=$((appended + 1))
-    done
-    if [[ $appended -gt 0 ]]; then
-      ok "Phase 7 complete: ${appended} edge-function secret name(s) staged in ${ENV_FUNCS}."
-      add_note "Edge-function secrets: fill in each ${appended} value(s) in ${ENV_FUNCS} and recreate the functions container: docker compose -f ${SUPABASE_COMPOSE_DIR}/docker-compose-supabase.yml up -d --force-recreate functions"
+    # Guard against an unwritable .env.functions (e.g. root-owned when migrate.sh
+    # runs as the deploy_user). Degrade gracefully with a report note instead of
+    # letting `set -e` abort the whole migration.
+    if [[ ! -w "$ENV_FUNCS" ]]; then
+      warn "cannot write ${ENV_FUNCS} (not writable) — secret NAMES not staged."
+      warn "  Run migrate.sh as the deploy_user/root, or fix its ownership and re-run, to stage them."
+      add_note "Edge-function secrets could not be staged: ${ENV_FUNCS} is not writable. Fill names/values manually."
     else
-      ok "Phase 7 complete — all edge-function secrets already staged or values present."
+      appended=0
+      for name in "${SECRET_NAMES[@]}"; do
+        [[ -z "$name" ]] && continue
+        # Never clobber an existing entry (an earlier run may have set a value).
+        grep -qE "^${name}=" "$ENV_FUNCS" 2>/dev/null && continue
+        if ! printf '%s=\n' "$name" >> "$ENV_FUNCS" 2>/dev/null; then
+          warn "  could not append '$name' to ${ENV_FUNCS}"
+          continue
+        fi
+        appended=$((appended + 1))
+      done
+      if [[ $appended -gt 0 ]]; then
+        ok "Phase 7 complete: ${appended} edge-function secret name(s) staged in ${ENV_FUNCS}."
+        add_note "Edge-function secrets: fill in each ${appended} value(s) in ${ENV_FUNCS} and recreate the functions container: docker compose -f ${SUPABASE_COMPOSE_DIR}/docker-compose-supabase.yml up -d --force-recreate functions"
+      else
+        ok "Phase 7 complete — all edge-function secrets already staged or values present."
+      fi
     fi
   fi
 fi
+
+# ─── Deferred FK constraints (re-create after all data phases) ───────────────
+# All data phases (DB, auth, storage, vault) are done; re-create the user-schema
+# FKs that reference Supabase-managed schemas and were dropped by Phase 1.
+if [[ -n "$DEFERRED_FK_SQL" && -s "$DEFERRED_FK_SQL" ]]; then
+  log "deferred FK constraints: re-creating (referencing auth/storage/vault)…"
+  if "$PSQL" "$TGT_DB_URL" -q -v ON_ERROR_STOP=0 -f "$DEFERRED_FK_SQL" 2>"$LOG_DIR/fk-restore.err"; then
+    ok "Deferred FK constraints re-created."
+  else
+    warn "some deferred FK constraints could not be created — see $LOG_DIR/fk-restore.err"
+    add_note "Deferred FK constraints had errors. See $LOG_DIR/fk-restore.err."
+  fi
+fi
+rm -f "$DEFERRED_FK_SQL" "$FK_ROWS"
 
 # ─── Phase 8: Manual-steps report ────────────────────────────────────────────
 print_manual_steps() {

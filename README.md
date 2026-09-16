@@ -428,7 +428,8 @@ $EDITOR env/migrate.yml       # fill the SOURCE (Cloud) and TARGET (self-hosted)
 ### Invariants
 
 - **Read-only against the source. Always.** `pg_dump` is inherently read-only,
-  `rclone copy` never deletes, and the script refuses to run if
+  `rclone` only lists/reads the source S3 (`lsf -R` / `cat`) while objects are written
+  to the target via its Storage REST API, and the script refuses to run if
   `source.db_url == target.db_url`.
 - **Refuses a non-empty target.** Layer 1 migrates into a fresh instance only.
 - **No resumability.** A failure means starting over.

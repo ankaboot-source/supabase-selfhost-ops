@@ -261,6 +261,12 @@ resources:
                         route:
                           cluster: storage
                           prefix_rewrite: /
+                          # Preserve the incoming Host header upstream so the
+                          # S3 SigV4 signature (bound to the original Host) can be
+                          # verified by storage-api. Without this, Envoy rewrites
+                          # Host to the upstream name (`storage`) and every signed
+                          # S3 request fails with SignatureDoesNotMatch.
+                          preserve_external_host: true
                           timeout: 30s
                         request_headers_to_add:
                           - header:
