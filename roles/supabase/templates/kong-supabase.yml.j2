@@ -158,6 +158,11 @@ services:
   - name: rest-v1
     _comment: 'PostgREST: /rest/v1/* -> http://rest:3000/*'
     url: http://rest:3000/
+    # Heavy RPCs (e.g. refine_persons over millions of pointsofcontact rows)
+    # legitimately run for minutes. Must stay above Postgres statement_timeout
+    # (120s for the authenticator role) or Kong kills the request first with
+    # a 60s default-cut timeout. Precedent: functions-v1 uses 150000.
+    read_timeout: 300000
     routes:
       - name: rest-v1-all
         strip_path: true
