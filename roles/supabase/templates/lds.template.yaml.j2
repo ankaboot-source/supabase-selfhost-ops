@@ -305,7 +305,13 @@ resources:
                         route:
                           cluster: rest
                           prefix_rewrite: /
-                          timeout: 30s
+                          # Heavy RPCs (e.g. refine_persons over millions of
+                          # pointsofcontact rows) legitimately run for minutes.
+                          # Must stay above Postgres statement_timeout (120s for
+                          # the authenticator role) or Envoy kills the request
+                          # first with a 30s default-cut timeout. Precedent:
+                          # functions-v1 uses 150s.
+                          timeout: 300s
                         request_headers_to_add:
                           - header:
                               key: X-Forwarded-Prefix
@@ -337,7 +343,13 @@ resources:
                         route:
                           cluster: rest
                           prefix_rewrite: /
-                          timeout: 30s
+                          # Heavy RPCs (e.g. refine_persons over millions of
+                          # pointsofcontact rows) legitimately run for minutes.
+                          # Must stay above Postgres statement_timeout (120s for
+                          # the authenticator role) or Envoy kills the request
+                          # first with a 30s default-cut timeout. Precedent:
+                          # functions-v1 uses 150s.
+                          timeout: 300s
                         request_headers_to_add:
                           - header:
                               key: X-Forwarded-Prefix
