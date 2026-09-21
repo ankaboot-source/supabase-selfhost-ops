@@ -143,9 +143,9 @@ jobs:
 
       - name: Smoke test the API gateway
         run: |
-          anon_key=$(sudo grep -oP '^sb_anon_key:\s*\K\S+' env/supabase.yml)
-          curl -fsS -H "apikey: ${anon_key}" http://localhost:8000/rest/v1/ > /dev/null
-          echo "Kong routed a REST request successfully."
+          service_role_key=$(sudo grep -oP '^sb_service_role_key:\s*\K\S+' env/supabase.yml)
+          curl -fsS -H "apikey: ${service_role_key}" http://localhost:8000/rest/v1/ > /dev/null
+          echo "Envoy routed a REST request successfully."
 
       - name: Smoke test Grafana
         run: |
@@ -635,10 +635,10 @@ jobs:
       # assertion on its own and prove nothing.
       - name: An API route is reachable through Caddy
         run: |
-          anon_key=$(sudo grep -oP '^sb_anon_key:\s*\K\S+' env/supabase.yml)
+          service_role_key=$(sudo grep -oP '^sb_service_role_key:\s*\K\S+' env/supabase.yml)
           curl -fsS --cacert /tmp/caddy-root.crt \
-            -H "apikey: ${anon_key}" https://sb.ci.invalid/rest/v1/ > /dev/null
-          echo "Kong is reachable through Caddy over TLS."
+            -H "apikey: ${service_role_key}" https://sb.ci.invalid/rest/v1/ > /dev/null
+          echo "API gateway is reachable through Caddy over TLS."
 
       - name: Studio is not reachable without authentication
         run: |
