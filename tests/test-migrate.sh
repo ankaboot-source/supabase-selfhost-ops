@@ -37,7 +37,7 @@ make_sandbox() {
 
   # Stub each binary. Each stub appends its argv (one line per arg, NUL-separated
   # for safety) to its .calls file, then behaves per env vars.
-  for bin in pg_dump pg_restore rclone psql supabase docker; do
+  for bin in pg_dump pg_restore rclone curl psql supabase docker; do
     cat > "$d/stub-bin/$bin" <<STUB
 #!/bin/bash
 # stub for $bin — logs argv, behaves per env vars
@@ -110,15 +110,28 @@ case "$bin" in
     ;;
   rclone)
     [[ "\${STUB_RCLONE_FAIL:-0}" == "1" ]] && exit 1
+    # lsf enumerates source object keys (read-only); cat streams one object.
+    # Emitting STUB_RCLONE_OBJECTS on lsf lets tests exercise the upload path.
+    if [[ " \$* " == *" lsf "* ]]; then
+      printf '%s\n' "\${STUB_RCLONE_OBJECTS:-}"
+    fi
+    exit 0
+    ;;
+  curl)
+    # Storage upload stub: mimics the -w http_code format by printing the code.
+    printf '%s' "\${STUB_CURL_CODE:-201}"
     exit 0
     ;;
   supabase)
     # Supabase CLI stub. Logs argv via the header block above, then:
-    #   functions list   -> prints STUB_SUPABASE_FUNCTIONS (a CLI table:
-    #                       "ID SLUG STATUS ..." — the parser reads SLUG as col 2)
+    #   functions list   -> prints STUB_SUPABASE_FUNCTIONS, a pipe-delimited
+    #                       table (ID | NAME | SLUG | STATUS | ...) — the
+    #                       parser strips ANSI, splits on the pipe, reads SLUG
+    #                       as field 2. Single-token-per-line lists also work.
     #   functions download <slug> -> writes ./supabase/functions/<slug>/index.ts
     #                                relative to CWD (mimics the real CLI)
-    #   secrets list     -> prints STUB_SUPABASE_SECRETS (a "DIGEST NAME" table)
+    #   secrets list     -> prints STUB_SUPABASE_SECRETS (pipe-delimited,
+    #                       NAME first: NAME | DIGEST); the parser reads field 0.
     case "\${1:-}" in
       functions)
         case "\${2:-}" in
@@ -234,6 +247,14 @@ if unfilled:
 PY
 }
 
+# Enable the storage object copy in a sandbox config. Phase 4 self-skips (and
+# never invokes rclone) unless the target's service_role_key is configured, so
+# storage-focused tests must set it to exercise the copy/upload path.
+enable_storage() {
+  local c="$1/env/migrate.yml"
+  sed -i 's|^  service_role_key: changeit|  service_role_key: tgtsvc12345|' "$c"
+}
+
 # ─── TC-MIG-001: Missing config file ─────────────────────────────────────────
 echo "TC-MIG-001: missing config file"
 d="$(make_sandbox tc001)"
@@ -287,10 +308,12 @@ echo "TC-MIG-005: missing required binary (rclone)"
 d="$(make_sandbox tc005)"
 cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
 fill_required "$d"
-# Remove the rclone stub so it's not on PATH
-rm "$d/stub-bin/rclone"
+# Point tools.rclone at a path that cannot exist so this branch is exercised
+# even on a machine where a real `rclone` is installed (removing the stub alone
+# would be shadowed by /usr/bin/rclone there).
+sed -i 's|^  rclone: rclone$|  rclone: /nonexistent/rclone|' "$d/env/migrate.yml"
 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
-if [[ $RC -ne 0 ]] && echo "$OUT" | grep -qi "required binary not found: rclone"; then
+if [[ $RC -ne 0 ]] && echo "$OUT" | grep -qi "required binary not found"; then
   ok "exits non-zero on missing rclone"
 else
   fail "expected non-zero exit on missing rclone (got rc=$RC)"
@@ -367,6 +390,7 @@ echo "TC-MIG-011: full happy path with stubs"
 d="$(make_sandbox tc011)"
 cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
 fill_required "$d"
+enable_storage "$d"
 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
 if [[ $RC -eq 0 ]] \
   && [[ -f "$d/stub-bin/pg_dump.calls" ]] \
@@ -400,6 +424,7 @@ echo "TC-MIG-013: read-only-source invariant (no write command against source)"
 d="$(make_sandbox tc013)"
 cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
 fill_required "$d"
+enable_storage "$d"
 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
 # Assert: pg_dump is the only binary pointed at the source DSN
 src_dsn="db.testprojref12345.supabase.co"
@@ -410,11 +435,13 @@ violations=()
 if [[ -f "$d/stub-bin/pg_restore.calls" ]] && grep -q "$src_dsn" "$d/stub-bin/pg_restore.calls"; then
   violations+=("pg_restore was pointed at the source DSN")
 fi
-# rclone must use copy, not sync/move/delete
+# rclone only ever READS the source (lsf = enumerate, cat = stream). It never
+# copies/syncs/writes from the source — the target is written via the REST API
+# (curl), not by rclone. Mutating subcommands against the source are a violation.
 if [[ -f "$d/stub-bin/rclone.calls" ]]; then
-  grep -q "ARG copy" "$d/stub-bin/rclone.calls" \
-    || violations+=("rclone ran without 'copy'")
-  if grep -qE "ARG (sync|move|delete|purge|rmdir)" "$d/stub-bin/rclone.calls"; then
+  grep -qE "ARG (lsf|cat)" "$d/stub-bin/rclone.calls" \
+    || violations+=("rclone ran without a read-only subcommand (lsf/cat)")
+  if grep -qE "ARG (sync|move|delete|purge|rmdir|copy|copyto|copy-url|mkdir|touch)" "$d/stub-bin/rclone.calls"; then
     violations+=("rclone used a mutating subcommand against the source")
   fi
 else
@@ -460,15 +487,19 @@ else
 fi
 
 # ─── TC-MIG-014: Storage failure is non-fatal + appears in runtime notes ──────
-echo "TC-MIG-014: storage failure is non-fatal + in runtime notes"
+echo "TC-MIG-014: storage upload failure is non-fatal + in runtime notes"
 d="$(make_sandbox tc014)"
 cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
 fill_required "$d"
-STUB_RCLONE_FAIL=1 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
-if [[ $RC -eq 0 ]] && echo "$OUT" | grep -qi "storage copy failed"; then
-  ok "storage failure is non-fatal and reported"
+enable_storage "$d"
+# One source object; the target REST upload returns 500 (curl stub). Phase 4
+# must NOT abort the migration — it warns, notes the partial, and exits 0.
+STUB_RCLONE_OBJECTS='mybucket/file.png' STUB_CURL_CODE=500 \
+  run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
+if [[ $RC -eq 0 ]] && echo "$OUT" | grep -qi "upload failed"; then
+  ok "storage upload failure is non-fatal and reported"
 else
-  fail "storage failure should be non-fatal (got rc=$RC)"
+  fail "storage upload failure should be non-fatal (got rc=$RC)"
 fi
 
 # ─── TC-MIG-015: Discovered schemas are dumped; a dump failure is fatal ───────
@@ -581,23 +612,24 @@ else
   fail "pg_restore DSN not passed via --dbname= or targets source"
 fi
 
-# ─── TC-MIG-021: Storage bucket definitions are dumped before the object copy ─
-echo "TC-MIG-021: storage.buckets dumped before rclone object copy"
+# ─── TC-MIG-021: Storage bucket definitions are dumped before the object phase ─
+echo "TC-MIG-021: storage.buckets dumped before the storage object phase"
 d="$(make_sandbox tc021)"
 cp "$d/env/migrate.example.yml" "$d/env/migrate.yml"
 fill_required "$d"
+enable_storage "$d"
 run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
 timeline="$d/stub-bin/call-timeline"
-# The buckets dump is the pg_dump invocation carrying --table=storage.buckets;
-# the object copy is the only rclone invocation. Their order in the shared
-# timeline proves Phase 3 precedes Phase 4.
+# The buckets dump is the pg_dump invocation carrying --table=storage.buckets
+# (Phase 3); the object phase begins with the rclone lsf object listing
+# (Phase 4). Their order in the shared timeline proves Phase 3 precedes Phase 4.
 bucket_dump_line="$(grep -n 'storage.buckets' "$timeline" | head -1 | cut -d: -f1)"
-copy_pos="$(grep -n '^rclone' "$timeline" | head -1 | cut -d: -f1)"
-if [[ -n "$bucket_dump_line" && -n "$copy_pos" ]] \
-  && [[ "$bucket_dump_line" -lt "$copy_pos" ]]; then
-  ok "storage.buckets dump precedes rclone object copy"
+object_pos="$(grep -n '^rclone' "$timeline" | head -1 | cut -d: -f1)"
+if [[ -n "$bucket_dump_line" && -n "$object_pos" ]] \
+  && [[ "$bucket_dump_line" -lt "$object_pos" ]]; then
+  ok "storage.buckets dump precedes the storage object phase"
 else
-  fail "storage.buckets not dumped, or not before rclone (bucket=$bucket_dump_line copy=$copy_pos)"
+  fail "storage.buckets not dumped, or not before the object phase (bucket=$bucket_dump_line object=$object_pos)"
 fi
 
 # ─── TC-MIG-022: Bucket restore is data-only + read-only, never touches source ─
@@ -707,12 +739,12 @@ fill_required "$d"
 mkdir -p "$d/funcs"
 sed -i "s|target_dir: supabase/docker/volumes/functions|target_dir: $d/funcs|" "$d/env/migrate.yml"
 STUB_SUPABASE_FUNCTIONS="$(
-  printf '%s\n' 'c731abc  my-func   DEPLOYED  1  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z'
-  printf '%s\n' '8f2d00e  helper    DEPLOYED  2  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z'
-  printf '%s\n' 'a1b2c3d  my-func   DEPLOYED  1  2024-01-01T00:00:00Z  2024-01-01T00:00:00Z' # dup slug
+  printf '%s\n' 'c731abc | My Func | my-func | DEPLOYED | 1 | 2024-01-01T00:00:00Z | 2024-01-01T00:00:00Z'
+  printf '%s\n' '8f2d00e | Helper | helper | DEPLOYED | 2 | 2024-01-01T00:00:00Z | 2024-01-01T00:00:00Z'
+  printf '%s\n' 'a1b2c3d | My Func | my-func | DEPLOYED | 1 | 2024-01-01T00:00:00Z | 2024-01-01T00:00:00Z' # dup slug
 )" STUB_SUPABASE_SECRETS="$(
-  printf '%s\n' 'abc12  SEMAPHORE'
-  printf '%s\n' 'def34  REDIS_URL'
+  printf '%s\n' 'SEMAPHORE | abc12'
+  printf '%s\n' 'REDIS_URL | def34'
 )" \
   run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
 if [[ $RC -eq 0 ]] \
@@ -778,8 +810,8 @@ mkdir -p "$d/funcs"
 sed -i "s|target_dir: supabase/docker/volumes/functions|target_dir: $d/funcs|" "$d/env/migrate.yml"
 printf 'SEMAPHORE=sk_real_value\n' > "$d/funcs/.env.functions"
 STUB_SUPABASE_SECRETS="$(
-  printf '%s\n' 'abc12  SEMAPHORE'
-  printf '%s\n' 'def34  NEW_SECRET'
+  printf '%s\n' 'SEMAPHORE | abc12'
+  printf '%s\n' 'NEW_SECRET | def34'
 )" run_migrate_rc "$d" --config "$d/env/migrate.yml" --yes
 if grep -q '^SEMAPHORE=sk_real_value$' "$d/funcs/.env.functions" \
   && grep -qE '^NEW_SECRET=$' "$d/funcs/.env.functions"; then
