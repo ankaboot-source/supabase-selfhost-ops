@@ -164,19 +164,26 @@ else
   echo "$OUT" | tail -20
 fi
 
-# ─── TC-SETUP-006: Components disabled by default ─────────────────────────────
-echo "TC-SETUP-006: components disabled by default"
+# ─── TC-SETUP-006: Components match the config.example.yml defaults ─────────
+echo "TC-SETUP-006: components match the config.example.yml defaults"
 d="$(make_sandbox tc006)"
 cp "$d/config.example.yml" "$d/config.yml"
 fill_required "$d"
 run_setup_rc "$d" --yes
 if [[ $RC -eq 0 ]]; then
-  # No advanced role should be enabled (uncommented) by default.
-  if grep -Eq '^[[:space:]]*-[[:space:]]+(caddy|monitor|fail2ban|backup|ufw|hardening|role:[[:space:]]*luks)\b' "$d/playbook-supabase.yml"; then
-    fail "some advanced roles were enabled unexpectedly"
+  # config.example.yml ships with caddy/monitor/fail2ban on by default and
+  # the rest off (PR #158) — the playbook must mirror exactly that set.
+  if ! grep -Eq '^[[:space:]]*-[[:space:]]+caddy\b' "$d/playbook-supabase.yml" \
+    || ! grep -Eq '^[[:space:]]*-[[:space:]]+monitor\b' "$d/playbook-supabase.yml" \
+    || ! grep -Eq '^[[:space:]]*-[[:space:]]+fail2ban\b' "$d/playbook-supabase.yml"; then
+    fail "default-enabled components (caddy/monitor/fail2ban) missing from playbook"
+    cat "$d/playbook-supabase.yml"
+  elif grep -Eq '^[[:space:]]*-[[:space:]]+(backup|ufw|hardening)\b' "$d/playbook-supabase.yml" \
+    || grep -Eq '^[[:space:]]*-[[:space:]]*role:[[:space:]]+luks\b' "$d/playbook-supabase.yml"; then
+    fail "default-disabled components (backup/ufw/luks/hardening) were enabled"
     cat "$d/playbook-supabase.yml"
   else
-    ok "no advanced roles enabled by default"
+    ok "playbook mirrors the config.example.yml component defaults"
   fi
 else
   fail "setup.sh failed with default config (rc=$RC)"
