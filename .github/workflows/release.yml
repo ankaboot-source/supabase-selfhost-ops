@@ -144,6 +144,44 @@ jobs:
           exit 1
           
 
+      - name: Debug API gateway (port 8000)
+        run: |
+
+          echo "================ docker ps -a (all, incl. exited) ================"
+          sudo docker ps -a --format 'table {{.Names}}\t{{.Ports}}\t{{.Status}}' 2>&1 || true
+
+          echo "================ api-gw container inspect ================"
+          sudo docker inspect \
+            --format 'state={{.State.Status}} health={{.State.Health.Status}} exited={{.State.ExitCode}} pid={{.State.Pid}}' \
+            supabase-envoy 2>&1 || echo "(supabase-envoy container not found)"
+          sudo docker inspect \
+            --format 'restart={{.HostConfig.RestartPolicy.Name}}' supabase-envoy 2>&1 || true
+
+          echo "================ host port 8000 listeners ================"
+          sudo ss -lntp 2>&1 | grep -E ':(8000|443)\b' || echo "NOTHING listening on host :8000"
+
+          echo "================ what the container maps to host ================"
+          sudo docker port supabase-envoy 2>&1 || echo "(no published ports / not running)"
+          sudo docker port supabase-envoy 8000 2>&1 || echo "(:8000 not published on supabase-envoy)"
+
+          echo "================ what the container hears inside ================"
+          timeout 2 sudo docker exec supabase-envoy sh -c \
+            '</dev/tcp/127.0.0.1/8000 && echo "INSIDE 8000: OPEN"' 2>&1 \
+            || echo "INSIDE 8000: CLOSED"
+
+          echo "================ healthcheck state ================"
+          sudo docker inspect --format 'health={{range .State.Health.Log}}exit={{.ExitCode}} {{.Output}}{{end}}' \
+            supabase-envoy 2>&1 || true
+
+          echo "================ envoy.log (last 50) ================"
+          sudo docker logs --tail 50 supabase-envoy 2>&1 || echo "(no logs)"
+
+      - name: Smoke test the API gateway
+        run: |
+          service_role_key=$(sudo grep -oP '^sb_service_role_key:\s*\K\S+' env/supabase.yml)
+          curl -fsS -H "apikey: ${service_role_key}" http://localhost:8000/rest/v1/ > /dev/null
+          echo "Envoy routed a REST request successfully."
+
       - name: Smoke test the API gateway
         run: |
           service_role_key=$(sudo grep -oP '^sb_service_role_key:\s*\K\S+' env/supabase.yml)
