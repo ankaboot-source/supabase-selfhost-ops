@@ -139,7 +139,10 @@ jobs:
                   "$c" 2>/dev/null || echo "(no healthcheck defined)"
                 echo "::endgroup::"
               done
+          docker ps -a
+          sudo docker ps -a
           exit 1
+          
 
       - name: Smoke test the API gateway
         run: |
