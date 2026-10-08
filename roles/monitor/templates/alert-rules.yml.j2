@@ -1,0 +1,179 @@
+# Grafana-provisioned alert rules. Rendered only when grafana_alerts_enabled is
+# true. These are GENERAL rules — no host/job/instance hardcoding — so they work
+# for any deploy. They rely on the pinned Prometheus datasource UID
+# PBFA97CFB590B2093 (see datasources.yml) and on cAdvisor's
+# `container_last_seen` / node-exporter's `node_filesystem_*` /
+# `node_memory_*` metrics.
+apiVersion: 1
+groups:
+    - orgId: 1
+      name: Supabase Containers Down
+      folder: Alerts
+      interval: 2m
+      rules:
+{% for c in grafana_alert_containers %}
+        - uid: {{ (c ~ '-down') | to_uuid }}
+          title: {{ c }}{{ '-' + deploy_env if deploy_env != 'changeit' else '' }} is down
+          condition: C
+          data:
+            - refId: Status
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: PBFA97CFB590B2093
+              model:
+                editorMode: code
+                expr: absent(container_last_seen{name="{{ c }}{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}"})
+                instant: true
+                intervalMs: 1000
+                legendFormat: __auto
+                maxDataPoints: 43200
+                range: false
+                refId: Status
+            - refId: C
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                        type: gt
+                      operator:
+                        type: and
+                      query:
+                        params:
+                            - C
+                      reducer:
+                        params: []
+                        type: last
+                      type: query
+                datasource:
+                    type: __expr__
+                    uid: __expr__
+                expression: Status
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: C
+                type: threshold
+          noDataState: OK
+          execErrState: Error
+          for: 2m
+          labels:
+            Status: Down
+          isPaused: false
+{% endfor %}
+    - orgId: 1
+      name: Disk Space Alert
+      folder: Alerts
+      interval: 5m
+      rules:
+        - uid: {{ ('disk usage') | to_uuid }}
+          title: Disk Usage high
+          condition: B
+          data:
+            - refId: Disk Usage
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: PBFA97CFB590B2093
+              model:
+                editorMode: code
+                expr: max((node_filesystem_size_bytes{fstype=~"ext.?|xfs"}-node_filesystem_free_bytes{fstype=~"ext.?|xfs"}) *100/(node_filesystem_avail_bytes{fstype=~"ext.?|xfs"}+(node_filesystem_size_bytes{fstype=~"ext.?|xfs"}-node_filesystem_free_bytes{fstype=~"ext.?|xfs"})))by(instance)
+                instant: true
+                intervalMs: 1000
+                legendFormat: __auto
+                maxDataPoints: 43200
+                range: false
+                refId: Disk Usage
+            - refId: B
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - 0
+                            - 0
+                        type: gt
+                      operator:
+                        type: and
+                      query:
+                        params: []
+                      reducer:
+                        params: []
+                        type: avg
+                      type: query
+                datasource:
+                    name: Expression
+                    type: __expr__
+                    uid: __expr__
+                expression: "${Disk Usage} >= {{ grafana_alert_disk_threshold }}"
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: B
+                type: math
+          noDataState: OK
+          execErrState: Error
+          for: 5m
+          labels:
+            Disk Space: High
+          isPaused: false
+    - orgId: 1
+      name: Memory usage
+      folder: Alerts
+      interval: 30s
+      rules:
+        - uid: {{ ('memory usage') | to_uuid }}
+          title: Host memory usage high
+          condition: B
+          data:
+            - refId: Memory Usage
+              relativeTimeRange:
+                from: 600
+                to: 0
+              datasourceUid: PBFA97CFB590B2093
+              model:
+                editorMode: code
+                expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))* 100
+                instant: true
+                intervalMs: 1000
+                legendFormat: __auto
+                maxDataPoints: 43200
+                range: false
+                refId: Memory Usage
+            - refId: B
+              datasourceUid: __expr__
+              model:
+                conditions:
+                    - evaluator:
+                        params:
+                            - {{ grafana_alert_memory_threshold }}
+                            - 0
+                        type: gt
+                      operator:
+                        type: and
+                      query:
+                        params: []
+                      reducer:
+                        params: []
+                        type: avg
+                      type: query
+                datasource:
+                    name: Expression
+                    type: __expr__
+                    uid: __expr__
+                expression: Memory Usage
+                intervalMs: 1000
+                maxDataPoints: 43200
+                refId: B
+                type: threshold
+          noDataState: OK
+          execErrState: Error
+          for: 30s
+          labels:
+            Memory Usage: Critical
+          isPaused: false
+          notification_settings:
+            receiver: grafana-email

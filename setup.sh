@@ -548,6 +548,53 @@ PYEOF
     set_env_var "GRAFANA_AUTH_BASIC_ENABLED" "true"
     set_env_var "GRAFANA_ADMIN_PASSWORD" "$(cfg_get "advanced.monitor.admin_password")"
   fi
+
+  # ── Alerts (container down / disk / memory) + alert-email SMTP ──
+  if cfg_bool "advanced.monitor.alerts_enabled"; then
+    set_env_var "grafana_alerts_enabled" "true"
+    set_env_var "grafana_alert_email"            "$(cfg_get "advanced.monitor.alert_emails")"
+    set_env_var "grafana_alert_disk_threshold"   "$(cfg_get "advanced.monitor.alert_disk_threshold")"
+    set_env_var "grafana_alert_memory_threshold" "$(cfg_get "advanced.monitor.alert_memory_threshold")"
+
+    # grafana_alert_containers is a LIST — set_env_var would corrupt it (it
+    # seds a `key: value` line). Replace the list items via Python instead.
+    python3 - "$ENV_FILE" "$CONFIG_FILE" <<'PYEOF'
+import sys, re, yaml
+env_path, cfg_path = sys.argv[1], sys.argv[2]
+with open(cfg_path) as f:
+    cfg = yaml.safe_load(f) or {}
+containers = (((cfg.get('advanced') or {}).get('monitor') or {}).get('alert_containers')) or []
+if not containers:
+    containers = ['supabase-envoy', 'supabase-db']
+items = "\n".join("  - %s" % c for c in containers)
+with open(env_path) as f:
+    content = f.read()
+replaced, n = re.subn(
+    r'(grafana_alert_containers:\n)(?:  -.*\n?)*',
+    lambda m: m.group(1) + items + "\n",
+    content,
+    count=1,
+)
+if n == 0:
+    sys.exit("grafana_alert_containers key not found in env/supabase.yml")
+with open(env_path, 'w') as f:
+    f.write(replaced)
+PYEOF
+
+    # Alert-email SMTP: prefer advanced.monitor.smtp_*; fall back to required.smtp_*
+    smtp_host="$(cfg_get "advanced.monitor.smtp_host")"
+    smtp_user="$(cfg_get "advanced.monitor.smtp_user")"
+    smtp_pass="$(cfg_get "advanced.monitor.smtp_password")"
+    smtp_sender="$(cfg_get "advanced.monitor.smtp_sender")"
+    [[ -z "$smtp_host" || "$smtp_host" == "changeit" ]] && smtp_host="$(cfg_get "required.smtp_host")"
+    [[ -z "$smtp_user" || "$smtp_user" == "changeit" ]] && smtp_user="$(cfg_get "required.smtp_user")"
+    [[ -z "$smtp_pass" || "$smtp_pass" == "changeit" ]] && smtp_pass="$(cfg_get "required.smtp_password")"
+    [[ -z "$smtp_sender" || "$smtp_sender" == "changeit" ]] && smtp_sender="$(cfg_get "required.smtp_admin_email")"
+    [[ -n "$smtp_host" ]] && set_env_var "GRAFANA_SMTP_HOST"   "$smtp_host"
+    [[ -n "$smtp_user" ]] && set_env_var "GRAFANA_SMTP_USER"   "$smtp_user"
+    [[ -n "$smtp_pass" ]] && set_env_var "GRAFANA_SMTP_PASSWORD" "$smtp_pass"
+    [[ -n "$smtp_sender" ]] && set_env_var "GRAFANA_SMTP_SENDER" "$smtp_sender"
+  fi
 fi
 
 if cfg_bool "components.backup"; then

@@ -1,0 +1,26 @@
+# Grafana-provisioned email contact point + notification policy. Rendered only
+# when grafana_alerts_enabled is true. Recipients come from grafana_alert_email.
+# Relies on the Grafana [smtp] block (grafana.ini), whose credentials are fed
+# from GRAFANA_SMTP_* set in setup.sh.
+apiVersion: 1
+contactPoints:
+    - orgId: 1
+      name: grafana-email
+      receivers:
+        - uid: {{ ('grafana-email-contact') | to_uuid }}
+          type: email
+          settings:
+            addresses: "{{ grafana_alert_email }}"
+            singleEmail: true
+          disableResolveMessage: true
+
+deleteContactPoints:
+  - orgId: 1
+    uid: ""
+
+policies:
+    - orgId: 1
+      receiver: grafana-email
+      group_by:
+        - grafana_folder
+      repeat_interval: 500d

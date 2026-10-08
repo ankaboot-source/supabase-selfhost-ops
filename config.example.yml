@@ -143,6 +143,23 @@ advanced:
     grafana_alert_host: monitor.example.com
     anonymous_enabled: true     # set false to require login
     admin_password: changeit   # only used when anonymous_enabled: false
+    # ── Alerts (Grafana-provisioned: container down, disk, memory) ──
+    # When alerts_enabled is true, Grafana provisions these rules + an email
+    # contact point. Emails are sent through the SMTP block below.
+    alerts_enabled: false       # set true to provision alert rules + email contact point
+    alert_emails: "you@example.com"  # recipients; space or ';' separated
+    alert_containers:            # base container names; deploy_env suffix is appended
+      - supabase-envoy          # API gateway (use supabase-kong w/ the Kong fallback override)
+      - supabase-db
+    alert_disk_threshold: 85     # % disk used before the disk alert fires
+    alert_memory_threshold: 80   # % host memory used before the memory alert fires
+
+    # Grafana alert-email SMTP. Leave blank/changeit to reuse required.smtp_*.
+    smtp_host: mail.example.com
+    smtp_user: user@example.com
+    smtp_password: changeit
+    smtp_sender: user@example.com
+
 
   # ── Backup / pgBackRest ── (only if components.backup: true)
   # Automated backups + continuous WAL archiving + point-in-time recovery.
