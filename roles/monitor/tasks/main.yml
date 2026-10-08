@@ -12,6 +12,9 @@
     - "/home/{{ deploy_user }}/{{ monitor_path }}/grafana"
     - "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/dashboards/default"
     - "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/datasources"
+{% if grafana_alerts_enabled | default(false) | bool %}
+    - "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/alerting"
+{% endif %}
 
 - name: Create monitor config files
   template:
@@ -30,6 +33,10 @@
     - { src: "pg-stats.json", dest: "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/dashboards/default/pg-stats.json", mode: '0664' }
     - { src: "grafana.ini", dest: "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/grafana.ini", mode: '0664' }
     - { src: "home.json", dest: "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/home.json", mode: '0664' }
+{% if grafana_alerts_enabled | default(false) | bool %}
+    - { src: "alert-rules.yml", dest: "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/alerting/alert-rules.yml", mode: '0664' }
+    - { src: "contact-point.yml", dest: "/home/{{ deploy_user }}/{{ monitor_path }}/grafana/provisioning/alerting/contact-point.yml", mode: '0664' }
+{% endif %}
 
 
 - name: Restart monitor instances

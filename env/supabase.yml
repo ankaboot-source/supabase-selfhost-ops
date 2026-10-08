@@ -36,6 +36,19 @@ GRAFANA_GITHUB_ROLE: "'Admin'" # refer here for additional infos => https://graf
 GRAFANA_SERVER_ROOT_URL: https://monitor.example.com # your dashboard url # REQUIRED
 GRAFANA_ALERT_HOST: monitor.example.com # REQUIRED
 
+# Grafana-provisioned alert rules (container down, disk, memory) + email
+# contact point.
+grafana_alerts_enabled: false
+# Base container names to alert on when down. The deploy_env suffix is appended
+# automatically. Default = Envoy API gateway + db. Use supabase-kong instead of
+# supabase-envoy when running the Kong fallback override.
+grafana_alert_containers:
+  - supabase-envoy
+  - supabase-db
+grafana_alert_email: ""              # alert recipients; space/; separated
+grafana_alert_disk_threshold: 85     # % used before the disk alert fires
+grafana_alert_memory_threshold: 80   # % used before the memory alert fires
+
 # SMTP for alerts
 GRAFANA_SMTP_PASSWORD: your_password
 GRAFANA_SMTP_HOST: mail.example.com
