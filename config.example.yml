@@ -163,12 +163,12 @@ advanced:
 
   # ── Backup / pgBackRest ── (only if components.backup: true)
   # Automated backups + continuous WAL archiving + point-in-time recovery.
-  # Defaults are hobby-safe (local MinIO, no encryption, .env creds).
+  # Defaults are hobby-safe (local RustFS, no encryption, .env creds).
   # Production hardening: override the 5 vars marked below — nothing else needed.
   backup:
-    # Repository type: minio (local, default) | s3 (external) | posix (local fs)
-    # WARNING: minio/posix are local — no off-box protection if the server dies.
-    repo_type: minio
+    # Repository type: rustfs (local, default) | s3 (external) | posix (local fs)
+    # WARNING: rustfs/posix are local — no off-box protection if the server dies.
+    repo_type: rustfs
 
     # --- S3 repo (only if repo_type: s3) ---
     # ENDPOINT MUST BE HOST-ONLY (no URL path): pgBackRest silently drops any
@@ -180,13 +180,13 @@ advanced:
     s3_bucket: changeit         # e.g. supabase-backups
     s3_access_key: changeit
     s3_secret_key: changeit
-    s3_uri_style: path          # path for MinIO/R2/Backblaze, host for AWS S3
-    s3_verify_tls: true         # set false for self-signed MinIO
+    s3_uri_style: path          # path for RustFS/R2/Backblaze, host for AWS S3
+    s3_verify_tls: true         # set false for self-signed local stores
 
-    # --- MinIO repo (only if repo_type: minio) ---
-    # Defaults: minioadmin/minioadmin. Override for production.
-    minio_root_user: minioadmin
-    minio_root_password: minioadmin
+    # --- Local RustFS repo (only if repo_type: rustfs) ---
+    # Defaults: rustfsadmin/rustfsadmin. Override for production.
+    rustfs_access_key: rustfsadmin
+    rustfs_secret_key: rustfsadmin
 
     # --- Encryption (PROD: set true for external repo) ---
     # OFF for local repo (your box, your key). ON for any external repo.

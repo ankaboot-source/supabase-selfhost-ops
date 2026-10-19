@@ -20,8 +20,8 @@
     drill_vol: "pgbackrest-verify-{{ ansible_date_time.epoch }}"
     drill_container: "supabase-verify-restore{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}"
     drill_pg_port: "{{ backup_drill_pg_port | default('5433') }}"
-    # Same external network the db and MinIO share; pgbackrest.conf points at
-    # minio:9000, which only resolves there.
+    # Same external network the db and RustFS share; pgbackrest.conf points at
+    # rustfs:9000, which only resolves there.
     backup_network: "supabase-backup-net{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}"
 
   tasks:
@@ -43,13 +43,13 @@
       changed_when: true
 
     # No lock directory from the db is mounted. /var/lib/pgbackrest holds only
-    # local lock state — the repository is in MinIO — so sharing the db's gains
+    # local lock state — the repository is in RustFS — so sharing the db's gains
     # nothing and cost two failures already: the exporter re-chowning it broke
     # archive-push, and mounting it :ro here made the image's entrypoint fail
     # with "chown: /var/lib/pgbackrest/lock: Read-only file system". This
     # container uses its own, from the image.
     #
-    # It does need the backup network: the repo is reached at minio:9000, which
+    # It does need the backup network: the repo is reached at rustfs:9000, which
     # does not resolve on the default bridge.
     - name: Restore into throwaway volume
       command: >

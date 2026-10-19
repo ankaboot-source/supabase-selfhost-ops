@@ -3,7 +3,7 @@
 # Supabase Storage volume backup.
 # Detects the Storage backend: if external S3, the volume backup is meaningless
 # (the bytes already live off-box). If file backend, tars ./volumes/storage/
-# into the pgbackrest repo (posix) or alongside it (s3/minio).
+# into the pgbackrest repo (posix) or alongside it (s3/rustfs).
 set -eu
 
 BACKUP_DIR="/home/{{ deploy_user }}/backup"
@@ -28,7 +28,7 @@ TAR_NAME="storage-${TIMESTAMP}.tar.gz"
 # Tar the storage volume into the pgbackrest repo path (host-side).
 # For posix repo: the repo is at $BACKUP_DIR/volumes/pgbackrest/ — the tar
 # lands inside the repo and is covered by retention/replication.
-# For s3/minio repo: the tar is alongside the repo dir; a future enhancement
+# For s3/rustfs repo: the tar is alongside the repo dir; a future enhancement
 # can rclone-copy it to the bucket. For now it's at least on the backup path.
 mkdir -p "$BACKUP_DIR/volumes/pgbackrest/storage-backups"
 tar -czf "$BACKUP_DIR/volumes/pgbackrest/storage-backups/${TAR_NAME}" \

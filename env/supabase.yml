@@ -261,8 +261,8 @@ fail2ban_service: fail2ban
 # Master toggle (set by setup.sh from components.backup)
 backup_enabled: false
 
-# Repository type: minio (local, default) | s3 (external) | posix (local fs)
-backup_repo_type: minio
+# Repository type: rustfs (local, default) | s3 (external) | posix (local fs)
+backup_repo_type: rustfs
 
 # S3 repo config (when backup_repo_type: s3)
 backup_s3_endpoint: changeit
@@ -273,9 +273,9 @@ backup_s3_key_secret: changeit
 backup_s3_uri_style: path
 backup_s3_verify_tls: true
 
-# MinIO creds (when backup_repo_type: minio)
-minio_root_user: minioadmin
-minio_root_password: minioadmin
+# Local RustFS creds (when backup_repo_type: rustfs)
+rustfs_access_key: rustfsadmin
+rustfs_secret_key: rustfsadmin
 
 # Encryption (forced ON for s3 repo by setup.sh)
 backup_encryption: false

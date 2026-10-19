@@ -8,7 +8,7 @@
       - deploy_user is defined
       - supabase_data_path is defined
       - backup_stanza_name is defined
-      - backup_repo_type in ['minio', 's3', 'posix']
+      - backup_repo_type in ['rustfs', 's3', 'posix']
       - backup_creds_source in ['env', 'vault']
     msg: "backup role: required variables missing or invalid"
 
@@ -20,12 +20,12 @@
       If the server dies, the backups die with it. For real protection,
       set backup_repo_type to 's3' and point it at an external object store
       (Cloudflare R2, Backblaze B2, AWS S3, etc.).
-  when: backup_repo_type in ['minio', 'posix']
+  when: backup_repo_type in ['rustfs', 'posix']
 
 - name: Warn when credentials are in .env (plaintext)
   debug:
     msg: >-
-      WARNING: backup_creds_source is 'env' (default). S3/MinIO credentials
+      WARNING: backup_creds_source is 'env' (default). S3/RustFS credentials
       are rendered into the backup .env file in plaintext. For production,
       set backup_creds_source to 'vault' and use Ansible Vault.
   when: backup_creds_source == 'env'
@@ -57,7 +57,7 @@
   vars:
     backup_compose_dir: "/home/{{ deploy_user }}/backup"
 
-# --- Ensure postgres (UID 100) can access pgbackrest dirs ---
+# --- Fix pgbackrest directory ownership for postgres access ---
 - name: Fix pgbackrest directory ownership for postgres access
   file:
     path: "{{ item }}"
@@ -71,6 +71,24 @@
     - "{{ backup_compose_dir }}/volumes/pgbackrest-spool"
   vars:
     backup_compose_dir: "/home/{{ deploy_user }}/backup"
+
+# --- Fix RustFS data/log dir ownership (RustFS runs as non-root UID 10001:10001) ---
+# RustFS refuses to start if its bind-mounted /data (and /app/logs) is not
+# writable by the runtime user. The rustfs-init one-shot also chowns them, but
+# the server starts first, so the dirs must already be owned correctly here.
+- name: Fix RustFS data/log directory ownership
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ rustfs_uid }}"
+    group: "{{ rustfs_gid }}"
+    mode: "0750"
+  loop:
+    - "{{ backup_compose_dir }}/volumes/rustfs"
+    - "{{ backup_compose_dir }}/volumes/rustfs-logs"
+  vars:
+    backup_compose_dir: "/home/{{ deploy_user }}/backup"
+  when: backup_repo_type == 'rustfs'
 
 # --- Render pgBackRest config ---
 - name: Render pgbackrest.conf
@@ -145,8 +163,9 @@
   loop_control:
     label: "{{ item.name }}"
 
-# --- Bring up the backup stack (minio + minio-init bucket creation + exporter) ---
-# minio-init runs once (restart: on-failure) after minio is healthy to create the bucket.
+# --- Bring up the backup stack (rustfs + rustfs-init bucket creation + exporter) ---
+# rustfs-init runs once (restart: on-failure) after rustfs is healthy to fix
+# ownership and create the bucket.
 - name: Bring up backup stack
   command: docker compose up -d
   args:
@@ -154,27 +173,27 @@
   vars:
     backup_compose_dir: "/home/{{ deploy_user }}/backup"
   changed_when: false
-  when: backup_repo_type == 'minio' or (backup_monitoring_enabled | default(false) | bool)
+  when: backup_repo_type == 'rustfs' or (backup_monitoring_enabled | default(false) | bool)
 
-# --- Wait for MinIO bucket creation (minio-init exits 0 when its 'mc mb' finished) ---
+# --- Wait for RustFS bucket creation (rustfs-init exits 0 when its 'mc mb' finished) ---
 # stanza-create needs the bucket to exist in the repo; otherwise it fails with 039.
-- name: Wait for MinIO bucket creation
+- name: Wait for RustFS bucket creation
   # Status as well as exit code. A container that has been created but never
   # started also reports ExitCode 0, so waiting on the code alone returned
-  # "ready" immediately — before minio-init had run, and therefore before the
-  # bucket existed. stanza-create then listed a bucket MinIO did not have and
+  # "ready" immediately — before rustfs-init had run, and therefore before the
+  # bucket existed. stanza-create then listed a bucket RustFS did not have and
   # got a 404, which surfaced much later as "[103] archive.info missing".
   # Whether it worked came down to which finished first.
   command: >-
     docker inspect
     --format='{% raw %}{{.State.Status}} {{.State.ExitCode}}{% endraw %}'
-    supabase-minio-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
-  register: minio_bucket_ready
-  until: (minio_bucket_ready.rc == 0) and (minio_bucket_ready.stdout | trim == 'exited 0')
+    supabase-rustfs-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
+  register: rustfs_bucket_ready
+  until: (rustfs_bucket_ready.rc == 0) and (rustfs_bucket_ready.stdout | trim == 'exited 0')
   retries: 40
   delay: 5
   changed_when: false
-  when: backup_repo_type == 'minio'
+  when: backup_repo_type == 'rustfs'
 
 # --- Wait for supabase-db to be READY (accepting connections, not in recovery) ---
 # pgbackrest commands (stanza-create, backup) need a live primary, not just a running container.
@@ -211,25 +230,25 @@
   changed_when: "'already exists' not in stanza_create_result.stdout | default('')"
   failed_when: false
 
-# --- If stanza-create fails with 028 (stale metadata), reset MinIO to a clean slate and retry ---
+# --- If stanza-create fails with 028 (stale metadata), reset RustFS to a clean slate and retry ---
 # The old repo is bound to a different DB system-id and is unusable; the clean
-# reset must RE-CREATE the bucket (minio-init's `mc mb` runs because the one-shot
-# container is removed). Wiping volumes/minio under the running MinIO and
+# reset must RE-CREATE the bucket (rustfs-init's `mc mb` runs because the one-shot
+# container is removed). Wiping volumes/rustfs under the running RustFS and
 # retrying would hit `039 NoSuchBucket` — the bucket would never come back.
-- name: Backup and reset stale MinIO data
+- name: Backup and reset stale RustFS data
   shell: |
     set -eu
     cd {{ backup_compose_dir }}
-    STALE_BACKUP="volumes/minio-stale-$(date +%Y%m%d-%H%M%S)"
-    echo "Stale stanza detected — preserving old MinIO data to $STALE_BACKUP"
-    docker compose stop minio minio-init >/dev/null 2>&1 || true
-    mv volumes/minio "$STALE_BACKUP" 2>/dev/null || true
+    STALE_BACKUP="volumes/rustfs-stale-$(date +%Y%m%d-%H%M%S)"
+    echo "Stale stanza detected — preserving old RustFS data to $STALE_BACKUP"
+    docker compose stop rustfs rustfs-init >/dev/null 2>&1 || true
+    mv volumes/rustfs "$STALE_BACKUP" 2>/dev/null || true
     # Drop the already-consumed one-shot so compose re-runs its `mc mb` entrypoint.
-    docker compose rm -f minio minio-init >/dev/null 2>&1 || true
-    docker compose up -d minio minio-init
-    echo "MinIO reset. Old data preserved at: $STALE_BACKUP"
+    docker compose rm -f rustfs rustfs-init >/dev/null 2>&1 || true
+    docker compose up -d rustfs rustfs-init
+    echo "RustFS reset. Old data preserved at: $STALE_BACKUP"
   when: >
-    backup_repo_type == 'minio'
+    backup_repo_type == 'rustfs'
     and stanza_create_result.rc | default(0) != 0
     and (
         '028' in ((stanza_create_result.stderr | default('')) ~ (stanza_create_result.stdout | default('')))
@@ -241,16 +260,16 @@
     backup_compose_dir: "/home/{{ deploy_user }}/backup"
 
 # --- After a stale reset, wait for the re-created bucket before retrying ---
-- name: Wait for MinIO bucket re-created after stale reset
-  command: docker inspect --format='{% raw %}{{.State.ExitCode}}{% endraw %}' supabase-minio-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
-  register: minio_bucket_ready_retry
-  until: (minio_bucket_ready_retry.rc == 0) and (minio_bucket_ready_retry.stdout == '0')
+- name: Wait for RustFS bucket re-created after stale reset
+  command: docker inspect --format='{% raw %}{{.State.ExitCode}}{% endraw %}' supabase-rustfs-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
+  register: rustfs_bucket_ready_retry
+  until: (rustfs_bucket_ready_retry.rc == 0) and (rustfs_bucket_ready_retry.stdout == '0')
   retries: 40
   delay: 5
   changed_when: false
   when: backup_clean_result is changed
 
-- name: Create pgBackRest stanza (retry after MinIO reset)
+- name: Create pgBackRest stanza (retry after RustFS reset)
   command: >
     docker exec supabase-db{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
     pgbackrest --stanza={{ backup_stanza_name }} --log-level-console=info stanza-create
@@ -268,7 +287,7 @@
       {% else %}
       {{ stanza_create_result.stderr or stanza_create_result.stdout or 'unknown error' }}
       {% endif %}
-  # Both branches must be covered. This used to fire only when a MinIO reset
+  # Both branches must be covered. This used to fire only when a RustFS reset
   # had happened, so a first stanza-create that failed on its own — the common
   # case, and the one that just hid an S3 404 for several runs — sailed past
   # the guard because stanza-create carries failed_when: false. The failure

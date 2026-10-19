@@ -52,8 +52,8 @@ fill_required() {
   sed -i 's|smtp_password: changeit|smtp_password: secret123|' "$c"
 }
 
-# Enable backup with local (minio) repo
-enable_backup_minio() {
+# Enable backup with local (rustfs) repo
+enable_backup_rustfs() {
   local c="$1/config.yml"
   sed -i 's|backup: false|backup: true|' "$c"
 }
@@ -62,7 +62,7 @@ enable_backup_minio() {
 enable_backup_s3() {
   local c="$1/config.yml"
   sed -i 's|backup: false|backup: true|' "$c"
-  sed -i 's|repo_type: minio|repo_type: s3|' "$c"
+  sed -i 's|repo_type: rustfs|repo_type: s3|' "$c"
   sed -i 's|s3_endpoint: changeit|s3_endpoint: https://s3.eu-west-1.amazonaws.com|' "$c"
   sed -i 's|s3_bucket: changeit|s3_bucket: my-backup-bucket|' "$c"
   sed -i 's|s3_access_key: changeit|s3_access_key: AKIATESTKEY|' "$c"
@@ -74,10 +74,10 @@ echo "TC-BACKUP-001: defaults render hobby-safe values"
 d="$(make_sandbox tc001)"
 cp "$d/config.example.yml" "$d/config.yml"
 fill_required "$d"
-enable_backup_minio "$d"
+enable_backup_rustfs "$d"
 run_setup_rc "$d" --yes
 ENV="$d/env/supabase.yml"
-if grep -q "backup_repo_type: minio" "$ENV" \
+if grep -q "backup_repo_type: rustfs" "$ENV" \
   && grep -q "backup_encryption: false" "$ENV" \
   && grep -q "backup_creds_source: env" "$ENV" \
   && grep -q "backup_restore_drill: false" "$ENV" \
@@ -96,7 +96,7 @@ echo "TC-BACKUP-002: local repo warning is printed"
 d="$(make_sandbox tc002)"
 cp "$d/config.example.yml" "$d/config.yml"
 fill_required "$d"
-enable_backup_minio "$d"
+enable_backup_rustfs "$d"
 run_setup_rc "$d" --yes
 if echo "$OUT" | grep -qi "no off-box protection"; then
   ok "local repo warning printed"
@@ -150,7 +150,7 @@ echo "TC-BACKUP-026: .env creds source warns"
 d="$(make_sandbox tc026)"
 cp "$d/config.example.yml" "$d/config.yml"
 fill_required "$d"
-enable_backup_minio "$d"
+enable_backup_rustfs "$d"
 run_setup_rc "$d" --yes
 if echo "$OUT" | grep -qi "plaintext"; then
   ok "plaintext creds warning printed"
@@ -163,7 +163,7 @@ echo "TC-BACKUP-030: playbook includes backup role when enabled"
 d="$(make_sandbox tc030)"
 cp "$d/config.example.yml" "$d/config.yml"
 fill_required "$d"
-enable_backup_minio "$d"
+enable_backup_rustfs "$d"
 run_setup_rc "$d" --yes
 PB="$d/playbook-supabase.yml"
 if grep -q "\- backup" "$PB"; then
@@ -330,16 +330,16 @@ else
   fail "exporter missing from backup compose"
 fi
 
-# ─── TC-BACKUP-007: minio + minio-init render for local repo ────────────────
-echo "TC-BACKUP-007: minio + minio-init render for local repo"
+# ─── TC-BACKUP-007: rustfs + rustfs-init render for local repo ────────────────
+echo "TC-BACKUP-007: rustfs + rustfs-init render for local repo"
 COMPOSE_BACKUP="$WORKTREE/roles/backup/templates/docker-compose-backup.yml.j2"
-if grep -q "backup_repo_type == 'minio'" "$COMPOSE_BACKUP" \
-  && grep -q "minio:" "$COMPOSE_BACKUP" \
-  && grep -q "minio-init:" "$COMPOSE_BACKUP" \
+if grep -q "backup_repo_type == 'rustfs'" "$COMPOSE_BACKUP" \
+  && grep -q "rustfs:" "$COMPOSE_BACKUP" \
+  && grep -q "rustfs-init:" "$COMPOSE_BACKUP" \
   && grep -q "127.0.0.1" "$COMPOSE_BACKUP"; then
-  ok "minio + minio-init present"
+  ok "rustfs + rustfs-init present"
 else
-  fail "minio + minio-init missing"
+  fail "rustfs + rustfs-init missing"
 fi
 
 # ─── TC-BACKUP-014: cron schedules render correctly ────────────────────────

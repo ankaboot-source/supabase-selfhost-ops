@@ -3,21 +3,21 @@
 
 [global]
 # Repository settings
-repo1-type={{ backup_repo_type if backup_repo_type != 'minio' else 's3' }}
+repo1-type={{ backup_repo_type if backup_repo_type != 'rustfs' else 's3' }}
 # A path *inside* the bucket, never the bucket name. It used to be set to
-# minio_bucket_name, which put the bucket name in the object keys a second
+# rustfs_bucket_name, which put the bucket name in the object keys a second
 # time — pgbackrest then listed
 #   GET /supabase-backups/?prefix=supabase-backups/archive/main/
-# and MinIO answered 404, so stanza-create never produced archive.info and
+# and the store answered 404, so stanza-create never produced archive.info and
 # every archive-push failed with "[103]: unable to find a valid repository".
 repo1-path=/pgbackrest
-{% if backup_repo_type == 'minio' %}
-# Local MinIO (S3-compatible)
-repo1-s3-bucket={{ minio_bucket_name }}
-repo1-s3-endpoint=http://minio:9000
+{% if backup_repo_type == 'rustfs' %}
+# Local RustFS (S3-compatible)
+repo1-s3-bucket={{ rustfs_bucket_name }}
+repo1-s3-endpoint=http://rustfs:{{ rustfs_api_port }}
 repo1-s3-region=us-east-1
-repo1-s3-key={{ backup_s3_key | default('minioadmin') if backup_creds_source | default('env') == 'env' else '${PGBACKREST_REPO1_S3_KEY}' }}
-repo1-s3-key-secret={{ backup_s3_key_secret | default('minioadmin') if backup_creds_source | default('env') == 'env' else '${PGBACKREST_REPO1_S3_KEY_SECRET}' }}
+repo1-s3-key={{ backup_s3_key | default('rustfsadmin') if backup_creds_source | default('env') == 'env' else '${PGBACKREST_REPO1_S3_KEY}' }}
+repo1-s3-key-secret={{ backup_s3_key_secret | default('rustfsadmin') if backup_creds_source | default('env') == 'env' else '${PGBACKREST_REPO1_S3_KEY_SECRET}' }}
 repo1-s3-uri-style=path
 repo1-s3-verify-tls=n
 {% elif backup_repo_type == 's3' %}

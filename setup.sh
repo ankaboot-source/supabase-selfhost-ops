@@ -176,9 +176,9 @@ warn_component_placeholders() {
   local warnings=0
   if cfg_bool "components.backup"; then
     repo_type="$(cfg_get "advanced.backup.repo_type")"
-    [[ -z "$repo_type" ]] && repo_type="minio"
+    [[ -z "$repo_type" ]] && repo_type="rustfs"
     # Warn on local repo (no off-box protection)
-    if [[ "$repo_type" == "minio" || "$repo_type" == "posix" ]]; then
+    if [[ "$repo_type" == "rustfs" || "$repo_type" == "posix" ]]; then
       warn "components.backup: repo_type is '$repo_type' (local) — no off-box protection."
       warn "  If the server dies, the backups die with it. Use s3 for real protection."
       warnings=$((warnings + 1))
@@ -600,7 +600,7 @@ fi
 if cfg_bool "components.backup"; then
   set_env_var "backup_enabled" "true"
   repo_type="$(cfg_get "advanced.backup.repo_type")"
-  [[ -z "$repo_type" ]] && repo_type="minio"
+  [[ -z "$repo_type" ]] && repo_type="rustfs"
   set_env_var "backup_repo_type" "$repo_type"
 
   # S3 repo config
@@ -614,15 +614,15 @@ if cfg_bool "components.backup"; then
   [[ -z "$s3_verify" ]] && s3_verify="true"
   set_env_var "backup_s3_verify_tls" "$s3_verify"
 
-  # MinIO creds (for local repo) — map to backup_s3_key/secret so templates work
-  if [[ "$repo_type" == "minio" ]]; then
-    minio_user="$(cfg_get "advanced.backup.minio_root_user")"
-    minio_pass="$(cfg_get "advanced.backup.minio_root_password")"
-    [[ -n "$minio_user" ]] && set_env_var "backup_s3_key" "$minio_user"
-    [[ -n "$minio_pass" ]] && set_env_var "backup_s3_key_secret" "$minio_pass"
+  # RustFS creds (for local repo) — map to backup_s3_key/secret so templates work
+  if [[ "$repo_type" == "rustfs" ]]; then
+    rustfs_key="$(cfg_get "advanced.backup.rustfs_access_key")"
+    rustfs_secret="$(cfg_get "advanced.backup.rustfs_secret_key")"
+    [[ -n "$rustfs_key" ]] && set_env_var "backup_s3_key" "$rustfs_key"
+    [[ -n "$rustfs_secret" ]] && set_env_var "backup_s3_key_secret" "$rustfs_secret"
   else
-    set_env_var "minio_root_user" "$(cfg_get "advanced.backup.minio_root_user")"
-    set_env_var "minio_root_password" "$(cfg_get "advanced.backup.minio_root_password")"
+    set_env_var "rustfs_access_key" "$(cfg_get "advanced.backup.rustfs_access_key")"
+    set_env_var "rustfs_secret_key" "$(cfg_get "advanced.backup.rustfs_secret_key")"
   fi
 
   # Encryption — forced ON for external (s3) repo

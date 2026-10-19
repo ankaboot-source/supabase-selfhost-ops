@@ -23,7 +23,7 @@ discover them the hard way.
   deploys Supabase with no reverse proxy and no dashboard authentication. Enabling
   `caddy`, `ufw`, `fail2ban` and `backup` is on you, and the installer warns about
   it rather than deciding for you.
-- **The default backup repository is local.** `repo_type: minio` writes backups to
+- **The default backup repository is local.** `repo_type: rustfs` writes backups to
   the same machine as the database. If the server dies, so do the backups. External
   S3 is one config block away, and the installer prints a loud warning until you
   switch.

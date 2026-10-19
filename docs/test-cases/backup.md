@@ -6,10 +6,10 @@ Tests are shell-level (matching `tests/test-setup.sh` / `tests/test-migrate.sh` 
 
 ## TC-BACKUP-001: defaults render hobby-safe values
 
-**Given** `config.yml` has `components.backup: true` and only `backup_repo_type: minio`.
+**Given** `config.yml` has `components.backup: true` and only `backup_repo_type: rustfs`.
 **When** `setup.sh` runs.
 **Then** `env/supabase.yml` contains:
-- `backup_repo_type: minio`
+- `backup_repo_type: rustfs`
 - `backup_encryption: false`
 - `backup_creds_source: env`
 - `backup_restore_drill: false`
@@ -21,7 +21,7 @@ Tests are shell-level (matching `tests/test-setup.sh` / `tests/test-migrate.sh` 
 
 ## TC-BACKUP-002: local repo warning is printed
 
-**Given** `backup_repo_type: minio` (or `posix`).
+**Given** `backup_repo_type: rustfs` (or `posix`).
 **When** `setup.sh` runs.
 **Then** stdout contains a loud warning mentioning "same machine" / "no off-box protection".
 
@@ -35,7 +35,7 @@ Tests are shell-level (matching `tests/test-setup.sh` / `tests/test-migrate.sh` 
 
 **Given** `backup_repo_type: s3` with s3 endpoint/bucket/region/keys set.
 **When** the `pgbackrest.conf.j2` template is rendered.
-**Then** output contains `repo1-type=s3`, `repo1-s3-bucket`, `repo1-s3-endpoint`, `repo1-s3-region`, `repo1-s3-key`, `repo1-s3-key-secret`, `repo1-s3-uri-style=path` (for MinIO-style) or `host` (for AWS).
+**Then** output contains `repo1-type=s3`, `repo1-s3-bucket`, `repo1-s3-endpoint`, `repo1-s3-region`, `repo1-s3-key`, `repo1-s3-key-secret`, `repo1-s3-uri-style=path` (for path-style stores) or `host` (for AWS).
 
 ## TC-BACKUP-005: pgbackrest.conf renders encryption for external repo
 
@@ -45,21 +45,21 @@ Tests are shell-level (matching `tests/test-setup.sh` / `tests/test-migrate.sh` 
 
 ## TC-BACKUP-006: pgbackrest.conf omits encryption for local repo
 
-**Given** `backup_repo_type: minio`, `backup_encryption: false`.
+**Given** `backup_repo_type: rustfs`, `backup_encryption: false`.
 **When** `pgbackrest.conf.j2` is rendered.
 **Then** output does **not** contain `repo1-cipher-type` or `repo1-cipher-pass`.
 
-## TC-BACKUP-007: docker-compose-backup renders minio + minio-init for local repo
+## TC-BACKUP-007: docker-compose-backup renders rustfs + rustfs-init for local repo
 
-**Given** `backup_repo_type: minio`.
+**Given** `backup_repo_type: rustfs`.
 **When** `docker-compose-backup.yml.j2` is rendered.
-**Then** output contains `minio` and `minio-init` services, bound to `127.0.0.1:9000` and `127.0.0.1:9001`.
+**Then** output contains `rustfs` and `rustfs-init` services, bound to `127.0.0.1:9000` and `127.0.0.1:9001`.
 
-## TC-BACKUP-008: docker-compose-backup omits minio for s3 repo
+## TC-BACKUP-008: docker-compose-backup omits rustfs for s3 repo
 
 **Given** `backup_repo_type: s3`.
 **When** `docker-compose-backup.yml.j2` is rendered.
-**Then** output does **not** contain `minio` or `minio-init` services.
+**Then** output does **not** contain `rustfs` or `rustfs-init` services.
 
 ## TC-BACKUP-009: supabase compose adds archive_command when backup enabled
 
@@ -77,7 +77,7 @@ Tests are shell-level (matching `tests/test-setup.sh` / `tests/test-migrate.sh` 
 
 **Given** backup role runs with `backup_enabled: true` for the first time.
 **When** the role executes.
-**Then** `docker exec supabase-db pgbackrest --stanza=main stanza-create` is invoked exactly once (after `supabase-minio-init` has exited 0).
+**Then** `docker exec supabase-db pgbackrest --stanza=main stanza-create` is invoked exactly once (after `supabase-rustfs-init` has exited 0).
 
 ## TC-BACKUP-012: stanza-create is not re-called on re-run (idempotency)
 
