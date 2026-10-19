@@ -172,19 +172,27 @@ jobs:
           done
           [ "$ok" = 1 ] || { echo "::error::RustFS /health never answered on 127.0.0.1:9000"; exit 1; }
 
-          echo "==== [3] rustfs-init completed -> bucket created (exit 0) ===="
-          sudo docker inspect --format 'state={{.State.Status}} exit={{.State.ExitCode}}' "$init" 2>&1 \
-            || echo "(supabase-rustfs-init not found)"
-          code=$(sudo docker inspect --format '{{.State.ExitCode}}' "$init" 2>/dev/null || echo 1)
-          [ "$code" = "0" ] || { echo "::error::rustfs-init did not exit 0 (bucket not created)"; exit 1; }
+          echo "==== [3] rustfs-init one-shot (informational) ===="
+          # The init is a one-shot (restart: on-failure) that exits 0 after
+          # creating the bucket. Docker/compose may have removed the exited
+          # container by now, so its absence is NOT a failure — the bucket's
+          # existence in [4] is the authoritative proof.
+          if sudo docker inspect --format 'state={{.State.Status}} exit={{.State.ExitCode}}' "$init" 2>/dev/null; then
+            echo "rustfs-init present; see exit code above"
+          else
+            echo "supabase-rustfs-init already ran and was removed (expected for a successful one-shot)"
+          fi
 
-          echo "==== [4] S3 auth + bucket listing via mc (independent of pgbackrest) ===="
+          echo "==== [4] S3 auth + bucket existence via mc (hard gate) ===="
+          # Independent of pgBackRest: authenticates against the S3 endpoint and
+          # requires the backup bucket to exist — the exact goal rustfs-init exists for.
           if sudo docker run --rm --network host \
              minio/mc:RELEASE.2025-04-16T18-13-26Z sh -c \
              "mc alias set local http://127.0.0.1:9000 '$key' '$secret' >/dev/null && mc ls local && mc stat local/supabase-backups" 2>&1; then
-            echo "mc authenticated and listed the backup bucket: OK"
+            echo "mc authenticated and confirmed the backup bucket exists: OK"
           else
-            echo "::warning::mc probe failed (see rustfs host logs below)"
+            echo "::error::mc could not authenticate or the backup bucket is missing"
+            exit 1
           fi
 
           echo "==== [5] pgBackRest reaches the repo (WAL archive check) ===="
