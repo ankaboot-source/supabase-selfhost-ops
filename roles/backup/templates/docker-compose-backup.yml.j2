@@ -31,14 +31,14 @@ services:
     networks:
       - default
 
-  # One-shot bootstrap: fix RustFS's data/log dir ownership (it runs as non-root
-  # UID {{ rustfs_uid }}:{{ rustfs_gid }}) and create the pgBackRest bucket. RustFS
-  # does not auto-create buckets on first write, so the bucket must exist before
-  # stanza-create or pgbackrest fails with 039. `mc mb` is standard S3 CreateBucket
-  # and works against any S3-compatible server; the MinIO-only `mc anonymous set`
-  # is intentionally omitted.
+  # One-shot bootstrap: create the pgBackRest bucket. RustFS does not
+  # auto-create buckets on first write, so the bucket must exist before
+  # stanza-create or pgbackrest fails with 039. The RustFS `rc` CLI (its
+  # first-party, mc-compatible client) is the recommended way to do this.
+  # Data/log dir ownership is handled by Ansible (RustFS runs as non-root
+  # UID {{ rustfs_uid }}:{{ rustfs_gid }}), so this container is network-only.
   rustfs-init:
-    image: {{ rustfs_mc_image }}
+    image: {{ rustfs_init_image }}
     container_name: supabase-rustfs-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
     depends_on:
       rustfs:
@@ -46,15 +46,11 @@ services:
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
-      chown -R {{ rustfs_uid }}:{{ rustfs_gid }} /data /app/logs;
       sleep 3;
-      mc alias set local http://rustfs:{{ rustfs_api_port }} '{{ backup_s3_key | default('rustfsadmin') }}' '{{ backup_s3_key_secret | default('rustfsadmin') }}';
-      mc mb -p local/{{ rustfs_bucket_name }};
+      rc alias set rustfs http://rustfs:{{ rustfs_api_port }} '{{ backup_s3_key | default('rustfsadmin') }}' '{{ backup_s3_key_secret | default('rustfsadmin') }}';
+      rc mb rustfs/{{ rustfs_bucket_name }};
       exit 0;
       "
-    volumes:
-      - ./volumes/rustfs:/data:z
-      - ./volumes/rustfs-logs:/app/logs:z
     networks:
       - default
 {% endif %}

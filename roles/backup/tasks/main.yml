@@ -175,7 +175,7 @@
   changed_when: false
   when: backup_repo_type == 'rustfs' or (backup_monitoring_enabled | default(false) | bool)
 
-# --- Wait for RustFS bucket creation (rustfs-init exits 0 when its 'mc mb' finished) ---
+# --- Wait for RustFS bucket creation (rustfs-init exits 0 when its 'rc mb' finished) ---
 # stanza-create needs the bucket to exist in the repo; otherwise it fails with 039.
 - name: Wait for RustFS bucket creation
   # Status as well as exit code. A container that has been created but never
@@ -232,7 +232,7 @@
 
 # --- If stanza-create fails with 028 (stale metadata), reset RustFS to a clean slate and retry ---
 # The old repo is bound to a different DB system-id and is unusable; the clean
-# reset must RE-CREATE the bucket (rustfs-init's `mc mb` runs because the one-shot
+# reset must RE-CREATE the bucket (rustfs-init's `rc mb` runs because the one-shot
 # container is removed). Wiping volumes/rustfs under the running RustFS and
 # retrying would hit `039 NoSuchBucket` — the bucket would never come back.
 - name: Backup and reset stale RustFS data
@@ -243,7 +243,7 @@
     echo "Stale stanza detected — preserving old RustFS data to $STALE_BACKUP"
     docker compose stop rustfs rustfs-init >/dev/null 2>&1 || true
     mv volumes/rustfs "$STALE_BACKUP" 2>/dev/null || true
-    # Drop the already-consumed one-shot so compose re-runs its `mc mb` entrypoint.
+    # Drop the already-consumed one-shot so compose re-runs its `rc mb` entrypoint.
     docker compose rm -f rustfs rustfs-init >/dev/null 2>&1 || true
     docker compose up -d rustfs rustfs-init
     echo "RustFS reset. Old data preserved at: $STALE_BACKUP"
