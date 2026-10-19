@@ -186,9 +186,13 @@ jobs:
           echo "==== [4] S3 auth + bucket existence via rc (hard gate) ===="
           # Independent of pgBackRest: authenticates against the S3 endpoint and
           # requires the backup bucket to exist — the exact goal rustfs-init exists for.
-          if sudo docker run --rm --network host \
-             rustfs/rc:v0.1.36 sh -c \
-             "rc alias set rustfs http://127.0.0.1:9000 '$key' '$secret' >/dev/null && rc ls rustfs/ && rc stat rustfs/supabase-backups" 2>&1; then
+          # The rc image's entrypoint is `rc` itself, so override it to a shell and run
+          # the whole chain in one container (an alias set in one docker run is not
+          # visible to the next).
+          if sudo docker run --rm --network host --entrypoint sh \
+             rustfs/rc:v0.1.36 -c \
+             "rc alias set rustfs http://127.0.0.1:9000 '$key' '$secret' >/dev/null && rc ls rustfs/" 2>&1 \
+             | grep -q "supabase-backups"; then
             echo "rc authenticated and confirmed the backup bucket exists: OK"
           else
             echo "::error::rc could not authenticate or the backup bucket is missing"
