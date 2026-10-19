@@ -183,15 +183,15 @@ jobs:
             echo "supabase-rustfs-init already ran and was removed (expected for a successful one-shot)"
           fi
 
-          echo "==== [4] S3 auth + bucket existence via mc (hard gate) ===="
+          echo "==== [4] S3 auth + bucket existence via rc (hard gate) ===="
           # Independent of pgBackRest: authenticates against the S3 endpoint and
           # requires the backup bucket to exist — the exact goal rustfs-init exists for.
           if sudo docker run --rm --network host \
-             minio/mc:RELEASE.2025-04-16T18-13-26Z sh -c \
-             "mc alias set local http://127.0.0.1:9000 '$key' '$secret' >/dev/null && mc ls local && mc stat local/supabase-backups" 2>&1; then
-            echo "mc authenticated and confirmed the backup bucket exists: OK"
+             rustfs/rc:v0.1.36 sh -c \
+             "rc alias set rustfs http://127.0.0.1:9000 '$key' '$secret' >/dev/null && rc ls rustfs/ && rc stat rustfs/supabase-backups" 2>&1; then
+            echo "rc authenticated and confirmed the backup bucket exists: OK"
           else
-            echo "::error::mc could not authenticate or the backup bucket is missing"
+            echo "::error::rc could not authenticate or the backup bucket is missing"
             exit 1
           fi
 

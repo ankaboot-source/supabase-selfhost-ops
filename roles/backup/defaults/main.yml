@@ -8,7 +8,7 @@
 pgbackrest_image: "woblerr/pgbackrest:2.58.0-alpine"
 pgbackrest_exporter_image: "woblerr/pgbackrest_exporter:v0.24.0"
 rustfs_image: "rustfs/rustfs:1.0.3"
-rustfs_mc_image: "minio/mc:RELEASE.2025-04-16T18-13-26Z"
+rustfs_init_image: "rustfs/rc:v0.1.36"
 
 # --- pgBackRest stanza ---
 backup_stanza_name: "main"
