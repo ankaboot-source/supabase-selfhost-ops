@@ -403,22 +403,38 @@
     mode: "0644"
   when: backup_enabled | default(false) | bool
 
-# --- Bring up MinIO before Supabase starts, so WAL archiving resolves on first boot ---
-- name: Render backup compose for MinIO
+# --- Bring up RustFS before Supabase starts, so WAL archiving resolves on first boot ---
+- name: Render backup compose for RustFS
   template:
     src: "{{ playbook_dir }}/roles/backup/templates/docker-compose-backup.yml.j2"
     dest: "/home/{{ deploy_user }}/backup/docker-compose.yml"
     owner: "{{ deploy_user }}"
     group: "{{ deploy_user }}"
     mode: "0640"
-  when: (backup_enabled | default(false) | bool) and (backup_repo_type | default('minio')) == 'minio'
+  when: (backup_enabled | default(false) | bool) and (backup_repo_type | default('rustfs')) == 'rustfs'
 
-- name: Start MinIO
-  command: docker compose up -d minio
+# RustFS runs as non-root UID 10001:10001 and will not boot if its bind-mounted
+# /data and /app/logs are not writable by that user. This runs here (before
+# Supabase boots) so WAL archiving resolves on first boot; the backup role
+# re-applies it idempotently on later runs.
+- name: Fix RustFS data/log ownership before Supabase boot
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ rustfs_uid | default('10001') }}"
+    group: "{{ rustfs_gid | default('10001') }}"
+    mode: "0750"
+  loop:
+    - "/home/{{ deploy_user }}/backup/volumes/rustfs"
+    - "/home/{{ deploy_user }}/backup/volumes/rustfs-logs"
+  when: (backup_enabled | default(false) | bool) and (backup_repo_type | default('rustfs')) == 'rustfs'
+
+- name: Start RustFS
+  command: docker compose up -d rustfs
   args:
     chdir: "/home/{{ deploy_user }}/backup"
   changed_when: false
-  when: (backup_enabled | default(false) | bool) and (backup_repo_type | default('minio')) == 'minio'
+  when: (backup_enabled | default(false) | bool) and (backup_repo_type | default('rustfs')) == 'rustfs'
 
 - name: Start Supabase
   command: "bash /home/{{ deploy_user }}/{{ supabase_path }}/start-supabase.sh"

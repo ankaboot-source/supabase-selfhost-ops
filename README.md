@@ -189,7 +189,7 @@ stack is documented for agents in [`AGENTS.md`](AGENTS.md).
 pgBackRest runs inside the `supabase-db` container: continuous WAL archiving,
 scheduled full and differential backups, **point-in-time recovery to the second**,
 and repository integrity verification. Backups go to an external S3 bucket (forced
-encryption), a local MinIO repo, or a POSIX path.
+encryption), a local RustFS repo, or a POSIX path.
 
 Restoring is a documented runbook, not an improvisation — the
 [restore-during-an-incident procedure](docs/advanced-docs.md#restore-during-an-incident--5-min)
@@ -313,9 +313,9 @@ dedicated disk volume and S3 credentials respectively — so they ship disabled.
 
 pgBackRest runs **inside** the `supabase-db` container (the upstream
 `supabase/postgres` image is not forked; the binary and libraries are bind-mounted
-in). It defaults to a local MinIO repo, which gives you no off-box protection and
+in). It defaults to a local RustFS repo, which gives you no off-box protection and
 prints a loud warning — switch to an external S3 bucket for real protection. When
-enabled, the installer brings MinIO up before Supabase so WAL archiving resolves on
+enabled, the installer brings RustFS up before Supabase so WAL archiving resolves on
 the database's first boot.
 
 ```yaml
@@ -323,7 +323,7 @@ components:
   backup: true
 advanced:
   backup:
-    repo_type: s3              # minio (local, default) | s3 (external) | posix (local fs)
+    repo_type: s3              # rustfs (local, default) | s3 (external) | posix (local fs)
     s3_endpoint: https://<your-endpoint>   # host-only, no URL path
     s3_region: us-east-1
     s3_bucket: supabase-backups

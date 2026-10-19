@@ -1,45 +1,60 @@
 # Managed by Ansible — do not edit manually.
-# Backup stack: optional MinIO + exporter. pgBackRest commands run inside supabase-db.
+# Backup stack: optional RustFS + exporter. pgBackRest commands run inside supabase-db.
 # Run from: {{ backup_compose_dir | default('/home/' ~ deploy_user ~ '/backup') }}
 
 services:
-{% if backup_repo_type == 'minio' %}
-  minio:
-    image: {{ minio_image }}
-    container_name: supabase-minio{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
+{% if backup_repo_type == 'rustfs' %}
+  rustfs:
+    image: {{ rustfs_image }}
+    container_name: supabase-rustfs{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
     restart: unless-stopped
-    command: ["server", "/data", "--console-address", ":{{ minio_console_port }}"]
+    security_opt:
+      - no-new-privileges:true
     environment:
-      MINIO_ROOT_USER: {{ backup_s3_key | default('minioadmin') }}
-      MINIO_ROOT_PASSWORD: {{ backup_s3_key_secret | default('minioadmin') }}
+      RUSTFS_ACCESS_KEY: {{ backup_s3_key | default('rustfsadmin') }}
+      RUSTFS_SECRET_KEY: {{ backup_s3_key_secret | default('rustfsadmin') }}
+      RUSTFS_ADDRESS: 0.0.0.0:{{ rustfs_api_port }}
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:{{ rustfs_console_port }}
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOG_DIRECTORY: /app/logs
     volumes:
-      - ./volumes/minio:/data:z
+      - ./volumes/rustfs:/data:z
+      - ./volumes/rustfs-logs:/app/logs:z
     ports:
-      - 127.0.0.1:{{ minio_api_port }}:9000
-      - 127.0.0.1:{{ minio_console_port }}:9001
+      - 127.0.0.1:{{ rustfs_api_port }}:{{ rustfs_api_port }}
+      - 127.0.0.1:{{ rustfs_console_port }}:{{ rustfs_console_port }}
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:{{ rustfs_api_port }}/health"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
       - default
 
-  minio-init:
-    image: {{ minio_mc_image }}
-    container_name: supabase-minio-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
+  # One-shot bootstrap: fix RustFS's data/log dir ownership (it runs as non-root
+  # UID {{ rustfs_uid }}:{{ rustfs_gid }}) and create the pgBackRest bucket. RustFS
+  # does not auto-create buckets on first write, so the bucket must exist before
+  # stanza-create or pgbackrest fails with 039. `mc mb` is standard S3 CreateBucket
+  # and works against any S3-compatible server; the MinIO-only `mc anonymous set`
+  # is intentionally omitted.
+  rustfs-init:
+    image: {{ rustfs_mc_image }}
+    container_name: supabase-rustfs-init{{ '-' + deploy_env if deploy_env != 'changeit' else '' }}
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
-      sleep 5;
-      mc alias set local http://minio:9000 '{{ backup_s3_key | default('minioadmin') }}' '{{ backup_s3_key_secret | default('minioadmin') }}';
-      mc mb -p local/{{ minio_bucket_name }};
-      mc anonymous set none local/{{ minio_bucket_name }};
+      chown -R {{ rustfs_uid }}:{{ rustfs_gid }} /data /app/logs;
+      sleep 3;
+      mc alias set local http://rustfs:{{ rustfs_api_port }} '{{ backup_s3_key | default('rustfsadmin') }}' '{{ backup_s3_key_secret | default('rustfsadmin') }}';
+      mc mb -p local/{{ rustfs_bucket_name }};
       exit 0;
       "
+    volumes:
+      - ./volumes/rustfs:/data:z
+      - ./volumes/rustfs-logs:/app/logs:z
     networks:
       - default
 {% endif %}
@@ -55,7 +70,7 @@ services:
     volumes:
       - ./pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
       # Its own lock directory, not the db's. /var/lib/pgbackrest holds only
-      # local lock state — the repository itself lives in MinIO over S3 — so
+      # local lock state — the repository itself lives in RustFS over S3 — so
       # there is nothing here the two need to share. Sharing it meant this
       # container's entrypoint re-chowned the directory to the image's uid and
       # PostgreSQL could no longer create /var/lib/pgbackrest/lock/*.lock, which
@@ -74,7 +89,7 @@ services:
       # against a target that was permanently down. Joining the exporter to the
       # monitoring network gives Prometheus a route to it — and nothing else:
       # only this container is attached, so the monitoring stack gains no path
-      # to MinIO or to the database, which stay on supabase-backup-net.
+      # to RustFS or to the database, which stay on supabase-backup-net.
       - monitor
 {% endif %}
 {% endif %}

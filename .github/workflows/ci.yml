@@ -181,7 +181,7 @@ jobs:
 
           advanced:
             backup:
-              repo_type: minio
+              repo_type: rustfs
           YAML
 
       # pgbackrest runs *inside* supabase-db, which is glibc, so the libc of the
@@ -391,14 +391,14 @@ jobs:
           # Separates "pgbackrest is stuck" from "the repo is unreachable": a
           # TCP connect to an address with no route hangs rather than refusing,
           # which looks identical from the outside.
-          echo "::group::can the db container reach MinIO?"
+          echo "::group::can the db container reach RustFS?"
           sudo timeout 20 docker exec supabase-db bash -c \
-            'if timeout 5 bash -c "exec 3<>/dev/tcp/minio/9000" 2>/dev/null; then
-               echo "TCP connect to minio:9000 OK"
+            'if timeout 5 bash -c "exec 3<>/dev/tcp/rustfs/9000" 2>/dev/null; then
+               echo "TCP connect to rustfs:9000 OK"
              else
-               echo "TCP connect to minio:9000 FAILED or timed out"
+               echo "TCP connect to rustfs:9000 FAILED or timed out"
              fi
-             getent hosts minio || echo "(minio does not resolve)"' 2>&1 || true
+             getent hosts rustfs || echo "(rustfs does not resolve)"' 2>&1 || true
           echo "::endgroup::"
 
           echo "::group::what PostgreSQL logged about archiving"

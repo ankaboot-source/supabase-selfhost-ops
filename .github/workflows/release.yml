@@ -90,7 +90,7 @@ jobs:
 
           advanced:
             backup:
-              repo_type: minio
+              repo_type: rustfs
               # Production points repo_type at a remote S3, and setup.sh forces
               # encryption on for that — so the encrypted repository is the one
               # real deployments use, and it was the one nothing exercised. The
@@ -143,6 +143,63 @@ jobs:
           sudo docker ps -a
           exit 1
           
+
+      # Prove the RustFS backup object store is actually functional — not just
+      # that a container exists. The deploy could render a compose and boot a
+      # healthy-looking server while the bucket never materialises or pgBackRest
+      # cannot reach it; each block below is independent evidence for one link.
+      # Hard failures abort the run; the trailing diagnostics show which link.
+      - name: RustFS backup store is functional
+        run: |
+          set -u
+          server=supabase-rustfs
+          init=supabase-rustfs-init
+          key=$(sudo grep -oP '^backup_s3_key:\s*\K\S+' env/supabase.yml || echo rustfsadmin)
+          secret=$(sudo grep -oP '^backup_s3_key_secret:\s*\K\S+' env/supabase.yml || echo rustfsadmin)
+
+          echo "==== [1] RustFS server running + healthy ===="
+          sudo docker inspect \
+            --format 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}} pid={{.State.Pid}}' \
+            "$server" 2>&1 || echo "(supabase-rustfs not found)"
+          status=$(sudo docker inspect --format '{{.State.Status}}' "$server" 2>/dev/null || echo missing)
+          [ "$status" = "running" ] || { echo "::error::supabase-rustfs is not running (state=$status)"; exit 1; }
+
+          echo "==== [2] S3 health endpoint answers on the wire ===="
+          ok=0
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:9000/health; then ok=1; break; fi
+            sleep 3
+          done
+          [ "$ok" = 1 ] || { echo "::error::RustFS /health never answered on 127.0.0.1:9000"; exit 1; }
+
+          echo "==== [3] rustfs-init completed -> bucket created (exit 0) ===="
+          sudo docker inspect --format 'state={{.State.Status}} exit={{.State.ExitCode}}' "$init" 2>&1 \
+            || echo "(supabase-rustfs-init not found)"
+          code=$(sudo docker inspect --format '{{.State.ExitCode}}' "$init" 2>/dev/null || echo 1)
+          [ "$code" = "0" ] || { echo "::error::rustfs-init did not exit 0 (bucket not created)"; exit 1; }
+
+          echo "==== [4] S3 auth + bucket listing via mc (independent of pgbackrest) ===="
+          if sudo docker run --rm --network host \
+             minio/mc:RELEASE.2025-04-16T18-13-26Z sh -c \
+             "mc alias set local http://127.0.0.1:9000 '$key' '$secret' >/dev/null && mc ls local && mc stat local/supabase-backups" 2>&1; then
+            echo "mc authenticated and listed the backup bucket: OK"
+          else
+            echo "::warning::mc probe failed (see rustfs host logs below)"
+          fi
+
+          echo "==== [5] pgBackRest reaches the repo (WAL archive check) ===="
+          if sudo docker exec supabase-db pgbackrest --stanza=main check 2>&1; then
+            echo "pgbackrest check: OK — archiving reaches RustFS"
+          else
+            echo "::error::pgbackrest could not reach the RustFS repo"
+            exit 1
+          fi
+
+          echo "==== [6] pgBackRest sees the repo state ===="
+          sudo docker exec supabase-db pgbackrest --stanza=main info 2>&1 | head -40 || true
+
+          echo "==== diagnostics only if something above looked wrong ===="
+          sudo docker logs --tail 40 "$server" 2>&1 || true
 
       - name: Debug API gateway (port 8000)
         run: |

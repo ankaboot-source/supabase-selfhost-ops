@@ -7,15 +7,15 @@
 # --- Container images (pinned for reproducibility) ---
 pgbackrest_image: "woblerr/pgbackrest:2.58.0-alpine"
 pgbackrest_exporter_image: "woblerr/pgbackrest_exporter:v0.24.0"
-minio_image: "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"
-minio_mc_image: "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z"
+rustfs_image: "rustfs/rustfs:1.0.3"
+rustfs_mc_image: "minio/mc:RELEASE.2025-04-16T18-13-26Z"
 
 # --- pgBackRest stanza ---
 backup_stanza_name: "main"
 
-# --- Repository type: minio (default, local) | s3 (external) | posix (local fs) ---
+# --- Repository type: rustfs (default, local) | s3 (external) | posix (local fs) ---
 # Overridden by env/supabase.yml when the user configures it.
-backup_repo_type: "minio"
+backup_repo_type: "rustfs"
 
 # --- Encryption (off for local, ON for external — forced in setup.sh) ---
 backup_encryption: false
@@ -71,13 +71,16 @@ pgbackrest_log_path: "/var/log/pgbackrest"
 pgbackrest_exporter_port: "9854"
 pgbackrest_exporter_scrape_interval: "60s"
 
-# --- MinIO (local repo defaults) ---
-minio_api_port: "9000"
-minio_console_port: "9001"
-minio_bucket_name: "supabase-backups"
+# --- RustFS (local repo defaults) ---
+rustfs_api_port: "9000"
+rustfs_console_port: "9001"
+rustfs_bucket_name: "supabase-backups"
+# RustFS runs its data server as a non-root user (UID/GID 10001:10001).
+rustfs_uid: "10001"
+rustfs_gid: "10001"
 
 # --- S3 repo defaults (overridden by env/supabase.yml) ---
-backup_s3_uri_style: "path"   # path for MinIO/R2, host for AWS
+backup_s3_uri_style: "path"   # path for RustFS/R2, host for AWS
 backup_s3_region: "us-east-1"
 backup_s3_verify_tls: true
 

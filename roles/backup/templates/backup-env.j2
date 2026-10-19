@@ -2,10 +2,10 @@
 # Backup stack environment (plaintext credentials — see backup_creds_source warning)
 # For production, use backup_creds_source: vault and Ansible Vault instead.
 
-{% if backup_repo_type == 'minio' %}
-# MinIO (local) credentials
-MINIO_ROOT_USER={{ backup_s3_key | default('minioadmin') }}
-MINIO_ROOT_PASSWORD={{ backup_s3_key_secret | default('minioadmin') }}
+{% if backup_repo_type == 'rustfs' %}
+# Local RustFS credentials
+RUSTFS_ACCESS_KEY={{ backup_s3_key | default('rustfsadmin') }}
+RUSTFS_SECRET_KEY={{ backup_s3_key_secret | default('rustfsadmin') }}
 {% elif backup_repo_type == 's3' %}
 # External S3 credentials
 PGBACKREST_REPO1_S3_KEY={{ backup_s3_key }}

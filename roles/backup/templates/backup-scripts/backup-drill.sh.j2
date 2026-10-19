@@ -38,7 +38,7 @@ trap cleanup EXIT
 #
 # No lock directory from the db is mounted — /var/lib/pgbackrest is local lock
 # state, the repository is remote — and the backup network is joined because
-# the repo is reached at minio:9000.
+# the repo is reached at rustfs:9000.
 if ! docker run --rm \
   --name "$DRILL_CONTAINER" \
   --user 0:0 \
