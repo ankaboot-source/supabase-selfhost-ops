@@ -134,7 +134,13 @@ services:
     routes:
       - name: rest-v1-openapi-root
         strip_path: true
-        expression: 'http.path == "/rest/v1/"'
+        # Exact-path match on the OpenAPI root only. `expression:` requires
+        # router_flavor=expressions and _format_version "3.0"; this file is
+        # "2.1", where Kong rejects it as an unknown field and refuses to boot
+        # (kong crash-loops, taking the whole Supabase API down). A regex path
+        # gives the same exact-match semantics under format 2.1.
+        paths:
+          - '~/rest/v1/$'
     plugins:
       - name: cors
       - name: key-auth
