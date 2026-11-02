@@ -1,4 +1,4 @@
-_format_version: '2.1'
+_format_version: '3.0'
 _transform: true
 
 ###
@@ -135,10 +135,10 @@ services:
       - name: rest-v1-openapi-root
         strip_path: true
         # Exact-path match on the OpenAPI root only. `expression:` requires
-        # router_flavor=expressions and _format_version "3.0"; this file is
-        # "2.1", where Kong rejects it as an unknown field and refuses to boot
-        # (kong crash-loops, taking the whole Supabase API down). A regex path
-        # gives the same exact-match semantics under format 2.1.
+        # router_flavor=expressions; Kong 3.9 rejects the `~/` regex-path form
+        # under _format_version "2.1" ("should start with: / or ~/"), which
+        # made kong crash-loop and took the whole Supabase API down. The
+        # declarative format "3.0" accepts regex paths with the default router.
         paths:
           - '~/rest/v1/$'
     plugins:
